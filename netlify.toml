@@ -1,0 +1,13 @@
+[build]
+  functions = "netlify/functions"
+  # If this repo is only the backend (no static site to publish), this
+  # empty publish dir is fine — Netlify will just run the functions.
+  publish = "public"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[functions]
+  node_bundler = "esbuild"
