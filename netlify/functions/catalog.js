@@ -1,6 +1,6 @@
 const { readRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
-const { rowsToObjects, pickField, toNumber, json, errorResponse, corsHeaders } = require("./_lib/rows");
+const { rowsToObjects, pickField, toNumber, parseStrengthMg, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
 const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", "peptide name"];
 const FORMAT_KEYS = ["format", "delivery", "type", "delivery format"];
@@ -26,7 +26,7 @@ exports.handler = async (event) => {
       .map((r) => ({
         name: (pickField(r, VENDOR_NAME_KEYS) || "").toString().trim(),
         format: (pickField(r, FORMAT_KEYS) || "Vial").toString().trim(),
-        strengthMg: toNumber(pickField(r, STRENGTH_KEYS)),
+        strengthMg: parseStrengthMg(pickField(r, STRENGTH_KEYS)),
         wholesalePrice: toNumber(pickField(r, PRICE_KEYS)),
       }))
       .filter((v) => v.name && v.strengthMg > 0 && v.wholesalePrice > 0);
