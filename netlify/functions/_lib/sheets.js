@@ -5,11 +5,26 @@ let cachedAuth = null;
 function getAuth() {
   if (cachedAuth) return cachedAuth;
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const rawKey = process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "";
-  const key = rawKey.replace(/\\n/g, "\n");
-  if (!email || !key) {
-    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY env vars");
+  let raw = (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").trim();
+
+  // Strip accidental wrapping quotes (happens if someone pastes the JSON
+  // file's "private_key": "..." value including the outer quote marks).
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1);
   }
+
+  // Normalize line endings: handle both literal "\n" text (two characters)
+  // and real newlines/CRLF, however it ended up after pasting into Netlify.
+  let key = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+  key = key.replace(/\r\n/g, "\n").trim();
+
+  if (!email) throw new Error("GOOGLE_SERVICE_ACCOUNT_EMAIL is missing.");
+  if (!key.includes("BEGIN PRIVATE KEY") || !key.includes("END PRIVATE KEY")) {
+    throw new Error(
+      "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY looks malformed — it should start with -----BEGIN PRIVATE KEY----- and end with -----END PRIVATE KEY-----, with no surrounding quote marks."
+    );
+  }
+
   cachedAuth = new google.auth.JWT({
     email,
     key,
