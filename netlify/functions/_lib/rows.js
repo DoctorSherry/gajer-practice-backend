@@ -35,6 +35,22 @@ function toNumber(v) {
   return isFinite(n) ? n : 0;
 }
 
+/**
+ * Parses a vendor "strength" cell into one total-mg number for that product.
+ * Handles combo products written like "10mg/10mg, 3mL" (two peptides in one
+ * pen) by adding up every "<number>mg" amount found — 10 + 10 = 20 — while
+ * correctly ignoring volume figures like "3mL" (different unit, not summed).
+ * A plain cell like "10" or "10mg" still just returns 10, same as before.
+ */
+function parseStrengthMg(v) {
+  const str = String(v ?? "");
+  const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg/gi)];
+  if (mgMatches.length) {
+    return mgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+  }
+  return toNumber(str);
+}
+
 const CORS_HEADERS = {
   "Content-Type": "application/json",
 };
@@ -59,4 +75,4 @@ function errorResponse(err) {
   return json(status, { error: err.message || "Internal error" });
 }
 
-module.exports = { rowsToObjects, pickField, toNumber, json, errorResponse, corsHeaders };
+module.exports = { rowsToObjects, pickField, toNumber, parseStrengthMg, json, errorResponse, corsHeaders };
