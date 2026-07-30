@@ -147,10 +147,19 @@ function pickField(row, candidates) {
 
 function parseVendorRow(r) {
   const num = (v) => parseFloat(String(v || "").replace(/[^0-9.]/g, ""));
+  // Sums every "<number>mg" amount found (handles combo products written
+  // like "10mg/10mg, 3mL" — two peptides in one pen — as 10+10=20mg total,
+  // correctly ignoring the "3mL" volume). Plain cells like "10" still work.
+  const parseStrengthMg = (v) => {
+    const str = String(v ?? "");
+    const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg/gi)];
+    if (mgMatches.length) return mgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+    return num(str);
+  };
   return {
     name: (pickField(r, ["product", "peptide", "name", "item", "product name", "peptide name"]) || "").trim(),
     format: (pickField(r, ["format", "delivery", "type", "delivery format"]) || "Vial").trim(),
-    strengthMg: num(pickField(r, ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"])),
+    strengthMg: parseStrengthMg(pickField(r, ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"])),
     wholesalePrice: num(pickField(r, ["price", "wholesale", "cost", "wholesale price", "office cost"])),
   };
 }
