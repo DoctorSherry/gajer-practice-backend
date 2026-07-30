@@ -11,10 +11,19 @@ function rowsToObjects(rows) {
   });
 }
 
-/** Case-insensitive lookup across a list of acceptable column-name synonyms. */
+/** Fuzzy lookup: matches if a column header CONTAINS one of the given
+ * keywords, not just an exact match — so real-world headers like
+ * "Peptide / Product Name" or "Price ($)" still match "peptide"/"price". */
 function pickField(obj, candidates) {
-  for (const k of Object.keys(obj)) {
+  const keys = Object.keys(obj);
+  // Prefer an exact match first (avoids ambiguity when both exist)
+  for (const k of keys) {
     if (candidates.includes(k.trim().toLowerCase())) return obj[k];
+  }
+  // Fall back to "header contains keyword"
+  for (const k of keys) {
+    const lower = k.trim().toLowerCase();
+    if (candidates.some((c) => lower.includes(c))) return obj[k];
   }
   return undefined;
 }
