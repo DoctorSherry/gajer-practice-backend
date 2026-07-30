@@ -246,6 +246,7 @@ export default function GajerPeptideApp() {
   const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState(null);
   const [config, setConfig] = useState({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
+  const [durationUnit, setDurationUnit] = useState("weeks"); // "weeks" | "days" — display/input only, stored value stays in weeks
   const [selectedVendorId, setSelectedVendorId] = useState(null);
   const [multiplier, setMultiplier] = useState(3);
   const [flatOverride, setFlatOverride] = useState(null);
@@ -257,6 +258,7 @@ export default function GajerPeptideApp() {
   const [blendName, setBlendName] = useState("");
   const [blendFreqPerWeek, setBlendFreqPerWeek] = useState(7);
   const [blendDurationWeeks, setBlendDurationWeeks] = useState(4);
+  const [blendDurationUnit, setBlendDurationUnit] = useState("weeks"); // "weeks" | "days" — display/input only
   const [blendDoseVolumeMl, setBlendDoseVolumeMl] = useState(0);
   const [blendComponents, setBlendComponents] = useState([]); // {key, name, doseMg, vendorId}
   const [blendMultiplier, setBlendMultiplier] = useState(3);
@@ -471,6 +473,7 @@ export default function GajerPeptideApp() {
     setSelectedKey(key);
     if (p && p.protocol) setConfig({ ...p.protocol });
     else setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
+    setDurationUnit("weeks");
     setMultiplier(3);
     setFlatOverride(null);
     setUseFlat(false);
@@ -479,12 +482,14 @@ export default function GajerPeptideApp() {
 
   function resetToStandard() {
     if (selectedPeptide && selectedPeptide.protocol) setConfig({ ...selectedPeptide.protocol });
+    setDurationUnit("weeks");
   }
 
   function clearProtocol() {
     setSelectedKey(null);
     setSelectedVendorId(null);
     setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
+    setDurationUnit("weeks");
     setMultiplier(3);
     setFlatOverride(null);
     setUseFlat(false);
@@ -579,7 +584,7 @@ export default function GajerPeptideApp() {
     setBlendComponents((prev) => prev.map((c) => (c.key === key ? { ...c, ...patch } : c)));
   }
   function resetBlendBuilder() {
-    setBlendName(""); setBlendFreqPerWeek(7); setBlendDurationWeeks(4); setBlendDoseVolumeMl(0);
+    setBlendName(""); setBlendFreqPerWeek(7); setBlendDurationWeeks(4); setBlendDurationUnit("weeks"); setBlendDoseVolumeMl(0);
     setBlendComponents([]); setBlendMultiplier(3); setBlendFlatOverride(null); setBlendUseFlat(false);
   }
 
@@ -664,6 +669,7 @@ export default function GajerPeptideApp() {
     setBlendName(tmpl.name);
     setBlendFreqPerWeek(tmpl.freqPerWeek);
     setBlendDurationWeeks(tmpl.durationWeeks);
+    setBlendDurationUnit("weeks");
     setBlendDoseVolumeMl(tmpl.doseVolumeMl || 0);
     setBlendComponents(tmpl.components.map((c) => ({ ...c })));
   }
@@ -991,7 +997,36 @@ export default function GajerPeptideApp() {
                     <div className="grid grid-cols-3 gap-3 mb-3">
                       <NumField label="Dose per administration" suffix="mg" value={config.doseMg} onChange={(v) => setConfig((c) => ({ ...c, doseMg: v }))} />
                       <NumField label="Frequency" suffix="per week" step="1" value={config.freqPerWeek} onChange={(v) => setConfig((c) => ({ ...c, freqPerWeek: v }))} />
-                      <NumField label="Duration" suffix="weeks" step="1" value={config.durationWeeks} onChange={(v) => setConfig((c) => ({ ...c, durationWeeks: v }))} />
+                      <div className="flex flex-col gap-1 text-xs" style={{ color: C.inkSoft }}>
+                        <div className="flex items-center justify-between">
+                          <span>Duration</span>
+                          <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                            {["weeks", "days"].map((u) => (
+                              <button
+                                key={u}
+                                onClick={() => setDurationUnit(u)}
+                                className="px-1.5 py-0.5 text-xs"
+                                style={{ background: durationUnit === u ? C.teal : "transparent", color: durationUnit === u ? "white" : C.inkSoft }}
+                              >
+                                {u}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number" step={durationUnit === "days" ? "1" : "0.5"}
+                            value={durationUnit === "days" ? Math.round(config.durationWeeks * 7 * 100) / 100 : config.durationWeeks}
+                            onChange={(e) => {
+                              const v = parseFloat(e.target.value) || 0;
+                              setConfig((c) => ({ ...c, durationWeeks: durationUnit === "days" ? v / 7 : v }));
+                            }}
+                            className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
+                            style={{ border: `1px solid ${C.line}`, color: C.ink, fontFamily: FONT_MONO, background: C.card }}
+                          />
+                          <span className="text-xs">{durationUnit}</span>
+                        </div>
+                      </div>
                     </div>
                     <div className="text-sm px-3 py-2 rounded-md" style={{ background: C.tealSoft, color: C.tealDark, fontFamily: FONT_MONO }}>
                       Total course requirement: <strong>{fmtMg(totalMg)}</strong>
@@ -1300,7 +1335,36 @@ export default function GajerPeptideApp() {
                     />
                   </label>
                   <NumField label="Shared frequency" suffix="per week" step="1" value={blendFreqPerWeek} onChange={setBlendFreqPerWeek} />
-                  <NumField label="Shared duration" suffix="weeks" step="1" value={blendDurationWeeks} onChange={setBlendDurationWeeks} />
+                  <div className="flex flex-col gap-1 text-xs" style={{ color: C.inkSoft }}>
+                    <div className="flex items-center justify-between">
+                      <span>Shared duration</span>
+                      <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                        {["weeks", "days"].map((u) => (
+                          <button
+                            key={u}
+                            onClick={() => setBlendDurationUnit(u)}
+                            className="px-1.5 py-0.5 text-xs"
+                            style={{ background: blendDurationUnit === u ? C.teal : "transparent", color: blendDurationUnit === u ? "white" : C.inkSoft }}
+                          >
+                            {u}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number" step={blendDurationUnit === "days" ? "1" : "0.5"}
+                        value={blendDurationUnit === "days" ? Math.round(blendDurationWeeks * 7 * 100) / 100 : blendDurationWeeks}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value) || 0;
+                          setBlendDurationWeeks(blendDurationUnit === "days" ? v / 7 : v);
+                        }}
+                        className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
+                        style={{ border: `1px solid ${C.line}`, color: C.ink, fontFamily: FONT_MONO, background: C.card }}
+                      />
+                      <span className="text-xs">{blendDurationUnit}</span>
+                    </div>
+                  </div>
                 </div>
                 <NumField label="Draw volume per administration (optional)" suffix="mL" step="0.05" value={blendDoseVolumeMl} onChange={setBlendDoseVolumeMl} />
 
