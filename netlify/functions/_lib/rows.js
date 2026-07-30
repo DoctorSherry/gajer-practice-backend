@@ -11,19 +11,21 @@ function rowsToObjects(rows) {
   });
 }
 
-/** Fuzzy lookup: matches if a column header CONTAINS one of the given
- * keywords, not just an exact match — so real-world headers like
- * "Peptide / Product Name" or "Price ($)" still match "peptide"/"price". */
+/** Fuzzy lookup: tries each candidate keyword in priority order (the order
+ * you list them), matching a column whose header contains that keyword.
+ * This lets a specific, clean column (e.g. "Freq / Week") be preferred over
+ * a vaguer, possibly-text one (e.g. "Frequency") by simply listing it first. */
 function pickField(obj, candidates) {
   const keys = Object.keys(obj);
-  // Prefer an exact match first (avoids ambiguity when both exist)
-  for (const k of keys) {
-    if (candidates.includes(k.trim().toLowerCase())) return obj[k];
+  // exact match first, respecting candidate priority order
+  for (const c of candidates) {
+    const hit = keys.find((k) => k.trim().toLowerCase() === c);
+    if (hit !== undefined) return obj[hit];
   }
-  // Fall back to "header contains keyword"
-  for (const k of keys) {
-    const lower = k.trim().toLowerCase();
-    if (candidates.some((c) => lower.includes(c))) return obj[k];
+  // then "header contains keyword", still respecting candidate priority order
+  for (const c of candidates) {
+    const hit = keys.find((k) => k.trim().toLowerCase().includes(c));
+    if (hit !== undefined) return obj[hit];
   }
   return undefined;
 }
