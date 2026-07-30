@@ -6,9 +6,11 @@ const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", 
 const FORMAT_KEYS = ["format", "delivery", "type", "delivery format"];
 const STRENGTH_KEYS = ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"];
 const PRICE_KEYS = ["price", "wholesale", "cost", "wholesale price", "office cost"];
-const DOSE_KEYS = ["dose", "dose_mg", "dosage", "dose (mg)"];
-const FREQ_KEYS = ["frequency", "freq", "times per week", "frequency_per_week", "freq/week"];
-const DURATION_KEYS = ["duration", "weeks", "duration_weeks", "course length", "duration (weeks)"];
+// Listed most-specific-first: a clean numeric column (if the sheet has one)
+// should always win over a vaguer or free-text column with a similar name.
+const DOSE_KEYS = ["recommended dose", "dose_mg", "dose (mg)", "dosage", "dose"];
+const FREQ_KEYS = ["freq / week", "freq/week", "frequency_per_week", "times per week", "freq", "frequency"];
+const DURATION_KEYS = ["treatment weeks", "duration_weeks", "duration (weeks)", "course length", "weeks", "duration"];
 
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders(), body: "" };
