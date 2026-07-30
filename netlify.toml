@@ -1,8 +1,7 @@
 [build]
+  command = "npm run build"
+  publish = "dist"
   functions = "netlify/functions"
-  # If this repo is only the backend (no static site to publish), this
-  # empty publish dir is fine — Netlify will just run the functions.
-  publish = "public"
 
 [[redirects]]
   from = "/api/*"
