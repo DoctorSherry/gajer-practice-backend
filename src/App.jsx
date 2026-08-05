@@ -563,6 +563,21 @@ export default function GajerPeptideApp() {
     setQuery("");
   }
 
+  // "Next patient" reset — clears the active patient and every builder
+  // (Search & Quote, Treatment Plan, Custom Blend, Export preview) so the
+  // next patient starts from a clean slate. Does NOT sign the doctor out.
+  function clearPatientSession() {
+    setActivePatientId(null);
+    setPatientIdInput("");
+    setPatientIdError("");
+    clearProtocol();
+    setPlanCart([]);
+    resetBlendBuilder();
+    setExportRecord(null);
+    setRecordStatus("purchased");
+    setActiveTab("search");
+  }
+
   function currentLineSnapshot() {
     return {
       key: selectedPeptide.key,
@@ -966,9 +981,18 @@ export default function GajerPeptideApp() {
               <Plus size={14} /> Create new patient
             </button>
             {activePatientId && (
-              <Tag tone="green" icon={<CheckCircle2 size={12} />}>
-                Active: {activePatientId} · {historyList.length} record{historyList.length === 1 ? "" : "s"}
-              </Tag>
+              <>
+                <Tag tone="green" icon={<CheckCircle2 size={12} />}>
+                  Active: {activePatientId} · {historyList.length} record{historyList.length === 1 ? "" : "s"}
+                </Tag>
+                <button
+                  onClick={clearPatientSession}
+                  className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md font-medium"
+                  style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}
+                >
+                  <X size={12} /> Clear (next patient)
+                </button>
+              </>
             )}
           </div>
           <div className="flex items-center justify-between mt-1.5">
