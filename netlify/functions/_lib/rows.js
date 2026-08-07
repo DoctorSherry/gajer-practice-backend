@@ -42,13 +42,33 @@ function toNumber(v) {
  * correctly ignoring volume figures like "3mL" (different unit, not summed).
  * A plain cell like "10" or "10mg" still just returns 10, same as before.
  */
-function parseStrengthMg(v) {
+/**
+ * Parses a vendor "strength" cell into a total-mg number for that product,
+ * correctly distinguishing units:
+ *   - "500mcg" -> 0.5 (mg) — NOT 500. mcg and mg are 1000x apart; treating
+ *     them the same silently makes every IU/mcg dose 1000x wrong.
+ *   - "10mg/10mg, 3mL" -> 20 (combo products, summed, volume ignored)
+ *   - "1mg/25mcg/20mg" -> 21.025 (mixed mg+mcg in one combo, both converted
+ *     to mg and summed)
+ *   - "50 IU" -> flagged unitRecognized:false — IU is a potency unit, not a
+ *     weight, and can't be converted to mg. strengthMg is returned as 0 so
+ *     it's never silently used in mg-based math; the frontend prompts the
+ *     doctor to enter that product's dose manually instead.
+ */
+function parseStrengthInfo(v) {
   const str = String(v ?? "");
-  const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg/gi)];
-  if (mgMatches.length) {
-    return mgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+  const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg\b/gi)];
+  const mcgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mcg\b/gi)];
+  if (mgMatches.length || mcgMatches.length) {
+    const mgSum = mgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
+    const mcgSum = mcgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0) / 1000;
+    return { strengthMg: mgSum + mcgSum, unitRecognized: true };
   }
-  return toNumber(str);
+  if (/\d+(?:\.\d+)?\s*iu\b/i.test(str)) {
+    const iuMatch = str.match(/(\d+(?:\.\d+)?)\s*iu\b/i);
+    return { strengthMg: 0, unitRecognized: false, rawStrength: str.trim(), rawUnitValue: parseFloat(iuMatch[1]) };
+  }
+  return { strengthMg: toNumber(str), unitRecognized: true };
 }
 
 const CORS_HEADERS = {
@@ -75,4 +95,4 @@ function errorResponse(err) {
   return json(status, { error: err.message || "Internal error" });
 }
 
-module.exports = { rowsToObjects, pickField, toNumber, parseStrengthMg, json, errorResponse, corsHeaders };
+module.exports = { rowsToObjects, pickField, toNumber, parseStrengthInfo, json, errorResponse, corsHeaders };
