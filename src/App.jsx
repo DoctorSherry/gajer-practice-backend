@@ -98,6 +98,8 @@ const money = (n) =>
   isFinite(n) ? n.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "—";
 const fmtMg = (n) => `${(Math.round(n * 100) / 100).toString()} mg`;
 
+const STRIPS_PER_BOX = 30; // the sheet's price/strength for "Strip" items describes a whole box, not one strip
+
 function buildDatabase(vendors, protocols) {
   const map = {};
   vendors.forEach((v) => {
@@ -107,7 +109,10 @@ function buildDatabase(vendors, protocols) {
     map[key].vendors.push({
       id: `${key}-${map[key].vendors.length}`,
       format: v.format || "Vial",
-      strengthMg: Number(v.strengthMg),
+      strengthMg: Number(v.strengthMg) || 0,
+      unitRecognized: v.unitRecognized !== false, // default true for older/sample data without this field
+      rawStrength: v.rawStrength,
+      rawUnitValue: v.rawUnitValue,
       wholesalePrice: Number(v.wholesalePrice),
     });
   });
@@ -129,13 +134,45 @@ function totalMgOf(config) {
   return (Number(config.doseMg) || 0) * (Number(config.freqPerWeek) || 0) * (Number(config.durationWeeks) || 0);
 }
 
-function computeVendorLine(vendor, totalMg) {
+function computeVendorLine(vendor, totalMg, totalDays, doseUnit) {
+  const isStrip = (vendor.format || "").toLowerCase().includes("strip");
+  const pricePerItem = isStrip ? vendor.wholesalePrice / STRIPS_PER_BOX : vendor.wholesalePrice;
+
+  if (isStrip) {
+    // A strip is always taken 1 per day, regardless of the configured dose
+    // or frequency — Patrick's rule. Duration alone determines how many are
+    // needed; the strip's own mg/IU content is informational only here.
+    const unitsNeeded = totalDays > 0 ? Math.ceil(totalDays) : 0;
+    const costOffice = unitsNeeded * pricePerItem;
+    const strengthMg = vendor.strengthMg || 0;
+    const perMgRate = strengthMg > 0 ? pricePerItem / strengthMg : 0;
+    return { unitsNeeded, costOffice, perMgRate, wasteMg: 0, pricePerItem, isStrip: true, manualRequired: false };
+  }
+
+  // Non-strip, IU-dosed product (sheet strength couldn't convert to mg) —
+  // only computable when the doctor has the dose unit toggle set to IU too.
+  if (vendor.unitRecognized === false) {
+    if (doseUnit !== "IU" || !vendor.rawUnitValue) {
+      return { unitsNeeded: 0, costOffice: 0, perMgRate: 0, wasteMg: 0, pricePerItem: vendor.wholesalePrice, manualRequired: true };
+    }
+    const unitsNeeded = totalMg > 0 ? Math.ceil(totalMg / vendor.rawUnitValue) : 0; // totalMg holds total IU here
+    const costOffice = unitsNeeded * vendor.wholesalePrice;
+    const perMgRate = vendor.wholesalePrice / vendor.rawUnitValue;
+    return { unitsNeeded, costOffice, perMgRate, wasteMg: 0, pricePerItem: vendor.wholesalePrice, manualRequired: false };
+  }
+
+  // Non-strip, mg-based product, but the doctor has the dose unit set to IU
+  // — units don't match this vendor row, so it can't be computed.
+  if (doseUnit === "IU") {
+    return { unitsNeeded: 0, costOffice: 0, perMgRate: 0, wasteMg: 0, pricePerItem, manualRequired: true, unitMismatch: true };
+  }
+
   const strengthMg = vendor.strengthMg || 0;
   const unitsNeeded = totalMg > 0 && strengthMg > 0 ? Math.ceil(totalMg / strengthMg) : 0;
-  const costOffice = unitsNeeded * vendor.wholesalePrice;
-  const perMgRate = strengthMg > 0 ? vendor.wholesalePrice / strengthMg : 0;
+  const costOffice = unitsNeeded * pricePerItem;
+  const perMgRate = strengthMg > 0 ? pricePerItem / strengthMg : 0;
   const wasteMg = unitsNeeded * strengthMg - totalMg;
-  return { unitsNeeded, costOffice, perMgRate, wasteMg: wasteMg > 0 ? wasteMg : 0 };
+  return { unitsNeeded, costOffice, perMgRate, wasteMg: wasteMg > 0 ? wasteMg : 0, pricePerItem, manualRequired: false };
 }
 
 function pickField(row, candidates) {
@@ -147,19 +184,28 @@ function pickField(row, candidates) {
 
 function parseVendorRow(r) {
   const num = (v) => parseFloat(String(v || "").replace(/[^0-9.]/g, ""));
-  // Sums every "<number>mg" amount found (handles combo products written
-  // like "10mg/10mg, 3mL" — two peptides in one pen — as 10+10=20mg total,
-  // correctly ignoring the "3mL" volume). Plain cells like "10" still work.
-  const parseStrengthMg = (v) => {
+  // Distinguishes mg from mcg (1000x apart — "500mcg" must read as 0.5mg,
+  // not 500mg), sums combo products like "10mg/10mg, 3mL" -> 20mg (ignoring
+  // the mL volume), and flags IU-dosed products (can't convert IU to mg) so
+  // the app prompts for a manual dose instead of silently mishandling them.
+  const parseStrengthInfo = (v) => {
     const str = String(v ?? "");
-    const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg/gi)];
-    if (mgMatches.length) return mgMatches.reduce((sum, m) => sum + parseFloat(m[1]), 0);
-    return num(str);
+    const mgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mg\b/gi)];
+    const mcgMatches = [...str.matchAll(/(\d+(?:\.\d+)?)\s*mcg\b/gi)];
+    if (mgMatches.length || mcgMatches.length) {
+      const mgSum = mgMatches.reduce((s, m) => s + parseFloat(m[1]), 0);
+      const mcgSum = mcgMatches.reduce((s, m) => s + parseFloat(m[1]), 0) / 1000;
+      return { strengthMg: mgSum + mcgSum, unitRecognized: true };
+    }
+    const iuMatch = str.match(/(\d+(?:\.\d+)?)\s*iu\b/i);
+    if (iuMatch) return { strengthMg: 0, unitRecognized: false, rawStrength: str.trim(), rawUnitValue: parseFloat(iuMatch[1]) };
+    return { strengthMg: num(str), unitRecognized: true };
   };
+  const strengthInfo = parseStrengthInfo(pickField(r, ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"]));
   return {
     name: (pickField(r, ["product", "peptide", "name", "item", "product name", "peptide name"]) || "").trim(),
     format: (pickField(r, ["format", "delivery", "type", "delivery format"]) || "Vial").trim(),
-    strengthMg: parseStrengthMg(pickField(r, ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"])),
+    ...strengthInfo,
     wholesalePrice: num(pickField(r, ["price", "wholesale", "cost", "wholesale price", "office cost"])),
   };
 }
@@ -275,6 +321,7 @@ export default function GajerPeptideApp() {
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [recordStatus, setRecordStatus] = useState("purchased"); // "consulted" | "purchased" — set right before saving any quote
   const [patientIdInput, setPatientIdInput] = useState("");
+  const [showPatientSuggestions, setShowPatientSuggestions] = useState(false);
   const [activePatientId, setActivePatientId] = useState(null);
   const [patientHistory, setPatientHistory] = useState({});
   const [patientIndex, setPatientIndex] = useState([]);
@@ -289,6 +336,9 @@ export default function GajerPeptideApp() {
   const [selectedKey, setSelectedKey] = useState(null);
   const [config, setConfig] = useState({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
   const [durationUnit, setDurationUnit] = useState("weeks"); // "weeks" | "days" — display/input only, stored value stays in weeks
+  const [usePhased, setUsePhased] = useState(false); // titrated/step dosing — e.g. MOTS-c: 2.4mg for 4wk, then 5mg for 2wk
+  const [phases, setPhases] = useState([{ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 }]);
+  const [doseUnit, setDoseUnit] = useState("mg"); // "mg" | "IU" — lets the Dose field itself be IU-denominated for IU-dosed products
   const [selectedVendorId, setSelectedVendorId] = useState(null);
   const [multiplier, setMultiplier] = useState(3);
   const [flatOverride, setFlatOverride] = useState(null);
@@ -318,6 +368,28 @@ export default function GajerPeptideApp() {
   const [importStatus, setImportStatus] = useState({ vendors: null, protocols: null });
 
   /* ---------- Google Sign-In ---------- */
+  // Restore a still-valid session from a previous visit so refreshing the
+  // page doesn't force signing in again every time.
+  useEffect(() => {
+    try {
+      const savedToken = localStorage.getItem("gajer_id_token");
+      const savedProfile = localStorage.getItem("gajer_auth_profile");
+      if (savedToken && savedProfile) {
+        const payload = JSON.parse(atob(savedToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+        const isExpired = payload.exp && Date.now() >= payload.exp * 1000;
+        if (!isExpired) {
+          setIdToken(savedToken);
+          setAuthProfile(JSON.parse(savedProfile));
+        } else {
+          localStorage.removeItem("gajer_id_token");
+          localStorage.removeItem("gajer_auth_profile");
+        }
+      }
+    } catch {
+      // corrupted/old storage — ignore and fall through to a normal sign-in prompt
+    }
+  }, []);
+
   useEffect(() => {
     function init() {
       if (!window.google?.accounts?.id) return;
@@ -345,7 +417,10 @@ export default function GajerPeptideApp() {
     setAuthError("");
     try {
       const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
-      setAuthProfile({ email: payload.email, name: payload.name || payload.email });
+      const profile = { email: payload.email, name: payload.name || payload.email };
+      setAuthProfile(profile);
+      localStorage.setItem("gajer_id_token", token);
+      localStorage.setItem("gajer_auth_profile", JSON.stringify(profile));
     } catch {
       setAuthProfile(null);
     }
@@ -354,6 +429,8 @@ export default function GajerPeptideApp() {
   function signOut() {
     setIdToken(null);
     setAuthProfile(null);
+    localStorage.removeItem("gajer_id_token");
+    localStorage.removeItem("gajer_auth_profile");
     try { window.google?.accounts?.id?.disableAutoSelect(); } catch {}
   }
 
@@ -364,6 +441,12 @@ export default function GajerPeptideApp() {
       headers: { "Content-Type": "application/json", ...(options.headers || {}), Authorization: `Bearer ${idToken}` },
     });
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      // Session expired (Google ID tokens are short-lived) — clear it so the
+      // UI cleanly falls back to "please sign in" instead of looping errors.
+      signOut();
+      throw new Error("Your session expired — please sign in again.");
+    }
     if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
     return data;
   }
@@ -411,21 +494,29 @@ export default function GajerPeptideApp() {
     setPatientIndex((prev) => (prev.includes(id) ? prev : [...prev, id].sort()));
   }
 
+  // Case-insensitive patient lookup — "john" finds "John" without creating a
+  // separate identity, and the ORIGINAL stored casing is what gets used.
+  function findStoredPatientId(input) {
+    const target = (input || "").trim().toLowerCase();
+    return patientIndex.find((id) => id.toLowerCase() === target) || null;
+  }
+
   function generatePatientId() {
     let candidate;
     do {
       candidate = `GJ-${Math.floor(1000 + Math.random() * 9000)}`;
-    } while (patientIndex.includes(candidate));
+    } while (findStoredPatientId(candidate));
     return candidate;
   }
 
   async function createNewPatient(customId) {
     if (!idToken) { setPatientIdError("Please sign in with Google first."); return; }
     const id = (customId || "").trim() || generatePatientId();
-    if (patientIndex.includes(id)) {
-      setPatientIdError(`Patient ID "${id}" already exists — loading their existing record instead.`);
-      setActivePatientId(id);
-      setPatientIdInput(id);
+    const existing = findStoredPatientId(id);
+    if (existing) {
+      setPatientIdError(`Patient ID "${existing}" already exists — loading their existing record instead.`);
+      setActivePatientId(existing);
+      setPatientIdInput(existing);
       return;
     }
     setPatientIdError("");
@@ -444,12 +535,14 @@ export default function GajerPeptideApp() {
     const trimmed = (id || "").trim();
     if (!trimmed) return;
     if (!idToken) { setPatientIdError("Please sign in with Google first."); return; }
-    if (!patientIndex.includes(trimmed)) {
+    const existing = findStoredPatientId(trimmed);
+    if (!existing) {
       setPatientIdError(`No existing record for "${trimmed}" yet — use "Create New" to start one.`);
       return;
     }
     setPatientIdError("");
-    setActivePatientId(trimmed);
+    setActivePatientId(existing);
+    setPatientIdInput(existing);
   }
 
   /* ---------- storage: load saved blend templates on mount ---------- */
@@ -517,10 +610,21 @@ export default function GajerPeptideApp() {
     () => peptideDatabase.find((p) => p.key === selectedKey) || null,
     [peptideDatabase, selectedKey]
   );
-  const totalMg = useMemo(() => totalMgOf(config), [config]);
+  // totalMg is "total dose quantity for the course" — in mg normally, or in
+  // IU when doseUnit is set to IU (the dose field itself holds whichever).
+  const totalMg = useMemo(
+    () => (usePhased ? phases.reduce((sum, p) => sum + totalMgOf(p), 0) : totalMgOf(config)),
+    [usePhased, phases, config]
+  );
+  // Separately, total course length in days — this is what actually drives
+  // strip counting (1 strip/day, regardless of dose/frequency/doseUnit).
+  const totalDays = useMemo(
+    () => (usePhased ? phases.reduce((sum, p) => sum + (Number(p.durationWeeks) || 0) * 7, 0) : (Number(config.durationWeeks) || 0) * 7),
+    [usePhased, phases, config]
+  );
   const vendorRows = useMemo(() => {
     if (!selectedPeptide) return [];
-    const rows = selectedPeptide.vendors.map((v) => ({ ...v, computed: computeVendorLine(v, totalMg) }));
+    const rows = selectedPeptide.vendors.map((v) => ({ ...v, computed: computeVendorLine(v, totalMg, totalDays, doseUnit) }));
     const withCost = rows.filter((r) => r.computed.costOffice > 0);
     const min = withCost.length ? Math.min(...withCost.map((r) => r.computed.costOffice)) : null;
     const max = withCost.length ? Math.max(...withCost.map((r) => r.computed.costOffice)) : null;
@@ -529,7 +633,7 @@ export default function GajerPeptideApp() {
       isCheapest: min !== null && r.computed.costOffice === min && min !== max,
       isPriciest: max !== null && r.computed.costOffice === max && min !== max,
     }));
-  }, [selectedPeptide, totalMg]);
+  }, [selectedPeptide, totalMg, totalDays, doseUnit]);
 
   const selectedVendor = vendorRows.find((v) => v.id === selectedVendorId) || vendorRows[0] || null;
   const officeCost = selectedVendor ? selectedVendor.computed.costOffice : 0;
@@ -541,6 +645,9 @@ export default function GajerPeptideApp() {
     if (p && p.protocol) setConfig({ ...p.protocol });
     else setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
     setDurationUnit("weeks");
+    setUsePhased(false);
+    setPhases([{ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 }]);
+    setDoseUnit("mg");
     setMultiplier(3);
     setFlatOverride(null);
     setUseFlat(false);
@@ -550,6 +657,9 @@ export default function GajerPeptideApp() {
   function resetToStandard() {
     if (selectedPeptide && selectedPeptide.protocol) setConfig({ ...selectedPeptide.protocol });
     setDurationUnit("weeks");
+    setUsePhased(false);
+    setPhases([{ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 }]);
+    setDoseUnit("mg");
   }
 
   function clearProtocol() {
@@ -557,10 +667,23 @@ export default function GajerPeptideApp() {
     setSelectedVendorId(null);
     setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
     setDurationUnit("weeks");
+    setUsePhased(false);
+    setPhases([{ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 }]);
+    setDoseUnit("mg");
     setMultiplier(3);
     setFlatOverride(null);
     setUseFlat(false);
     setQuery("");
+  }
+
+  function addPhase() {
+    setPhases((prev) => [...prev, { doseMg: prev[prev.length - 1]?.doseMg || 0, freqPerWeek: prev[prev.length - 1]?.freqPerWeek || 0, durationWeeks: 0 }]);
+  }
+  function removePhase(index) {
+    setPhases((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
+  }
+  function updatePhase(index, patch) {
+    setPhases((prev) => prev.map((p, i) => (i === index ? { ...p, ...patch } : p)));
   }
 
   // "Next patient" reset — clears the active patient and every builder
@@ -583,8 +706,10 @@ export default function GajerPeptideApp() {
       key: selectedPeptide.key,
       name: selectedPeptide.displayName,
       config: { ...config },
+      doseUnit,
+      phases: usePhased ? phases.map((p) => ({ ...p })) : undefined,
       totalMg,
-      vendor: selectedVendor ? { format: selectedVendor.format, strengthMg: selectedVendor.strengthMg, wholesalePrice: selectedVendor.wholesalePrice } : null,
+      vendor: selectedVendor ? { format: selectedVendor.format, strengthMg: selectedVendor.strengthMg, wholesalePrice: selectedVendor.wholesalePrice, rawStrength: selectedVendor.rawStrength } : null,
       unitsNeeded: selectedVendor ? selectedVendor.computed.unitsNeeded : 0,
       officeCost,
       multiplier,
@@ -953,18 +1078,40 @@ export default function GajerPeptideApp() {
         <div className="print-hide mb-4 p-3 rounded-xl" style={{ background: C.card, border: `1px solid ${C.line}` }}>
           <div className="flex items-center gap-2 flex-wrap">
             <User size={16} color={C.teal} />
-            <input
-              value={patientIdInput}
-              onChange={(e) => { setPatientIdInput(e.target.value); setPatientIdError(""); }}
-              onKeyDown={(e) => { if (e.key === "Enter") loadExistingPatient(patientIdInput); }}
-              placeholder="Patient ID (e.g. GJ-1042)"
-              list="known-patient-ids"
-              className="flex-1 min-w-[160px] px-2 py-1.5 rounded-md text-sm outline-none"
-              style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, color: C.ink }}
-            />
-            <datalist id="known-patient-ids">
-              {patientIndex.map((id) => <option key={id} value={id} />)}
-            </datalist>
+            <div className="relative flex-1 min-w-[160px]">
+              <input
+                value={patientIdInput}
+                onChange={(e) => { setPatientIdInput(e.target.value); setPatientIdError(""); setShowPatientSuggestions(true); }}
+                onFocus={() => setShowPatientSuggestions(true)}
+                onBlur={() => setTimeout(() => setShowPatientSuggestions(false), 150)} // delay so a suggestion click registers before the list disappears
+                onKeyDown={(e) => { if (e.key === "Enter") { loadExistingPatient(patientIdInput); setShowPatientSuggestions(false); } }}
+                placeholder="Patient ID or name (e.g. GJ-1042)"
+                className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
+                style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, color: C.ink }}
+              />
+              {showPatientSuggestions && patientIdInput.trim() && (() => {
+                const q = patientIdInput.trim().toLowerCase();
+                const matches = patientIndex.filter((id) => id.toLowerCase().includes(q)).slice(0, 8);
+                if (!matches.length) return null;
+                return (
+                  <div
+                    className="absolute left-0 right-0 mt-1 rounded-md overflow-hidden z-20"
+                    style={{ background: C.card, border: `1px solid ${C.line}`, boxShadow: "0 4px 16px rgba(30,27,23,0.12)" }}
+                  >
+                    {matches.map((id) => (
+                      <button
+                        key={id}
+                        onMouseDown={() => { loadExistingPatient(id); setShowPatientSuggestions(false); }}
+                        className="w-full text-left px-3 py-1.5 text-sm tgp-row-hover"
+                        style={{ color: C.ink, fontFamily: FONT_MONO }}
+                      >
+                        {id}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+            </div>
             <button
               onClick={() => loadExistingPatient(patientIdInput)}
               disabled={!patientIdInput.trim()}
@@ -985,6 +1132,15 @@ export default function GajerPeptideApp() {
                 <Tag tone="green" icon={<CheckCircle2 size={12} />}>
                   Active: {activePatientId} · {historyList.length} record{historyList.length === 1 ? "" : "s"}
                 </Tag>
+                {historyList.length > 0 && (
+                  <button
+                    onClick={() => setActiveTab("history")}
+                    className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md font-medium"
+                    style={{ background: C.tealSoft, color: C.tealDark }}
+                  >
+                    <HistoryIcon size={12} /> View records
+                  </button>
+                )}
                 <button
                   onClick={clearPatientSession}
                   className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md font-medium"
@@ -1154,40 +1310,94 @@ export default function GajerPeptideApp() {
                         </div>
                       }
                     />
-                    <div className="grid grid-cols-3 gap-3 mb-3">
-                      <NumField label="Dose per administration" suffix="mg" value={config.doseMg} onChange={(v) => setConfig((c) => ({ ...c, doseMg: v }))} />
-                      <NumField label="Frequency" suffix="per week" step="1" value={config.freqPerWeek} onChange={(v) => setConfig((c) => ({ ...c, freqPerWeek: v }))} />
-                      <div className="flex flex-col gap-1 text-xs" style={{ color: C.inkSoft }}>
-                        <div className="flex items-center justify-between">
-                          <span>Duration</span>
-                          <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
-                            {["weeks", "days"].map((u) => (
-                              <button
-                                key={u}
-                                onClick={() => setDurationUnit(u)}
-                                className="px-1.5 py-0.5 text-xs"
-                                style={{ background: durationUnit === u ? C.teal : "transparent", color: durationUnit === u ? "white" : C.inkSoft }}
-                              >
-                                {u}
-                              </button>
-                            ))}
+
+                    <label className="flex items-center gap-2 text-xs mb-3" style={{ color: C.inkSoft }}>
+                      <input type="checkbox" checked={usePhased} onChange={(e) => setUsePhased(e.target.checked)} />
+                      Phased / titrated dosing — dose changes partway through the course (e.g. MOTS-c: 2.4mg for 4wk, then 5mg for 2wk)
+                    </label>
+
+                    {!usePhased ? (
+                      <div className="grid grid-cols-3 gap-3 mb-3">
+                        <div className="flex flex-col gap-1 text-xs" style={{ color: C.inkSoft }}>
+                          <div className="flex items-center justify-between">
+                            <span>Dose per administration</span>
+                            <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                              {["mg", "IU"].map((u) => (
+                                <button
+                                  key={u}
+                                  onClick={() => setDoseUnit(u)}
+                                  className="px-1.5 py-0.5 text-xs"
+                                  style={{ background: doseUnit === u ? C.teal : "transparent", color: doseUnit === u ? "white" : C.inkSoft }}
+                                >
+                                  {u}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="number" step="0.1" value={config.doseMg}
+                              onChange={(e) => setConfig((c) => ({ ...c, doseMg: parseFloat(e.target.value) || 0 }))}
+                              className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
+                              style={{ border: `1px solid ${C.line}`, color: C.ink, fontFamily: FONT_MONO, background: C.card }}
+                            />
+                            <span className="text-xs">{doseUnit}</span>
                           </div>
                         </div>
-                        <div className="flex items-center gap-1">
-                          <input
-                            type="number" step={durationUnit === "days" ? "1" : "0.5"}
-                            value={durationUnit === "days" ? Math.round(config.durationWeeks * 7 * 100) / 100 : config.durationWeeks}
-                            onChange={(e) => {
-                              const v = parseFloat(e.target.value) || 0;
-                              setConfig((c) => ({ ...c, durationWeeks: durationUnit === "days" ? v / 7 : v }));
-                            }}
-                            className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
-                            style={{ border: `1px solid ${C.line}`, color: C.ink, fontFamily: FONT_MONO, background: C.card }}
-                          />
-                          <span className="text-xs">{durationUnit}</span>
+                        <NumField label="Frequency" suffix="per week" step="1" value={config.freqPerWeek} onChange={(v) => setConfig((c) => ({ ...c, freqPerWeek: v }))} />
+                        <div className="flex flex-col gap-1 text-xs" style={{ color: C.inkSoft }}>
+                          <div className="flex items-center justify-between">
+                            <span>Duration</span>
+                            <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                              {["weeks", "days"].map((u) => (
+                                <button
+                                  key={u}
+                                  onClick={() => setDurationUnit(u)}
+                                  className="px-1.5 py-0.5 text-xs"
+                                  style={{ background: durationUnit === u ? C.teal : "transparent", color: durationUnit === u ? "white" : C.inkSoft }}
+                                >
+                                  {u}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="number" step={durationUnit === "days" ? "1" : "0.5"}
+                              value={durationUnit === "days" ? Math.round(config.durationWeeks * 7 * 100) / 100 : config.durationWeeks}
+                              onChange={(e) => {
+                                const v = parseFloat(e.target.value) || 0;
+                                setConfig((c) => ({ ...c, durationWeeks: durationUnit === "days" ? v / 7 : v }));
+                              }}
+                              className="w-full px-2 py-1.5 rounded-md text-sm outline-none"
+                              style={{ border: `1px solid ${C.line}`, color: C.ink, fontFamily: FONT_MONO, background: C.card }}
+                            />
+                            <span className="text-xs">{durationUnit}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div className="flex flex-col gap-2 mb-3">
+                        {phases.map((p, i) => (
+                          <div key={i} className="p-2.5 rounded-lg grid grid-cols-4 gap-2 items-end" style={{ background: C.paper }}>
+                            <div className="text-xs font-medium col-span-4 flex items-center justify-between" style={{ color: C.inkSoft }}>
+                              <span>Phase {i + 1}</span>
+                              {phases.length > 1 && (
+                                <button onClick={() => removePhase(i)} className="p-0.5 rounded" style={{ color: C.clay }}><X size={13} /></button>
+                              )}
+                            </div>
+                            <NumField label="Dose" suffix="mg" value={p.doseMg} onChange={(v) => updatePhase(i, { doseMg: v })} />
+                            <NumField label="Frequency" suffix="per week" step="1" value={p.freqPerWeek} onChange={(v) => updatePhase(i, { freqPerWeek: v })} />
+                            <NumField label="Duration" suffix="weeks" step="0.5" value={p.durationWeeks} onChange={(v) => updatePhase(i, { durationWeeks: v })} />
+                            <div className="text-xs self-center" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>= {fmtMg(totalMgOf(p))}</div>
+                          </div>
+                        ))}
+                        <button onClick={addPhase} className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md self-start" style={{ border: `1px solid ${C.line}`, color: C.teal }}>
+                          <Plus size={13} /> Add phase
+                        </button>
+                      </div>
+                    )}
+
                     <div className="text-sm px-3 py-2 rounded-md" style={{ background: C.tealSoft, color: C.tealDark, fontFamily: FONT_MONO }}>
                       Total course requirement: <strong>{fmtMg(totalMg)}</strong>
                     </div>
@@ -1197,18 +1407,29 @@ export default function GajerPeptideApp() {
                   <div className="rounded-xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
                     <SectionTitle eyebrow={patientMode ? "Options" : "Vendor match"} title={patientMode ? "Choose a product option" : "Pricing by product option"} />
                     <div className="flex flex-col gap-2">
-                      {vendorRows.map((v) => (
+                      {vendorRows.map((v) => {
+                        const isStrip = (v.format || "").toLowerCase().includes("strip");
+                        return (
                         <button
                           key={v.id}
-                          onClick={() => setSelectedVendorId(v.id)}
+                          onClick={() => { setSelectedVendorId(v.id); if (!isStrip) setDoseUnit(v.unitRecognized === false ? "IU" : "mg"); }}
                           className="text-left p-3 rounded-lg flex items-center justify-between gap-3"
                           style={{
                             border: `1.5px solid ${selectedVendorId === v.id ? C.teal : C.line}`,
-                            borderLeft: patientMode ? `4px solid ${selectedVendorId === v.id ? C.teal : C.line}` : `4px solid ${v.isCheapest ? C.success : v.isPriciest ? C.clay : (selectedVendorId === v.id ? C.teal : C.line)}`,
+                            borderLeft: patientMode || v.unitRecognized === false ? `4px solid ${selectedVendorId === v.id ? C.teal : C.line}` : `4px solid ${v.isCheapest ? C.success : v.isPriciest ? C.clay : (selectedVendorId === v.id ? C.teal : C.line)}`,
                             background: selectedVendorId === v.id ? C.tealSoft : C.paper,
                           }}
                         >
-                          {patientMode ? (
+                          {v.unitRecognized === false ? (
+                            <>
+                              <div>
+                                <div className="text-sm font-medium" style={{ color: C.ink }}>
+                                  {v.format} · {v.rawStrength} — {money(v.wholesalePrice)}
+                                </div>
+                                <div className="text-xs mt-1" style={{ color: C.amber }}>Dosed in IU — enter dose manually below</div>
+                              </div>
+                            </>
+                          ) : patientMode ? (
                             <>
                               <div className="text-sm font-medium" style={{ color: C.ink }}>{v.format} · {v.strengthMg}mg</div>
                               <div className="text-right">
@@ -1219,12 +1440,13 @@ export default function GajerPeptideApp() {
                             <>
                               <div>
                                 <div className="text-sm font-medium" style={{ color: C.ink }}>
-                                  {v.format} · {v.strengthMg}mg — {money(v.wholesalePrice)}
+                                  {v.format} · {v.strengthMg}mg — {money(v.wholesalePrice)}{isStrip ? ` /box of ${STRIPS_PER_BOX}` : ""}
                                   {v.isCheapest && <Tag tone="green" icon={<TrendingDown size={11} />}>Best value</Tag>}
                                   {v.isPriciest && <Tag tone="clay" icon={<TrendingUp size={11} />}>Highest cost</Tag>}
                                 </div>
                                 <div className="text-xs mt-1" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>
-                                  {money(v.computed.perMgRate)}/mg · {v.computed.unitsNeeded} unit{v.computed.unitsNeeded === 1 ? "" : "s"} needed
+                                  {isStrip && `${money(v.computed.pricePerItem)}/strip · `}
+                                  {money(v.computed.perMgRate)}/mg · {v.computed.unitsNeeded} {isStrip ? "strip" : "unit"}{v.computed.unitsNeeded === 1 ? "" : "s"} needed
                                   {v.computed.wasteMg > 0 && ` · ${fmtMg(v.computed.wasteMg)} leftover`}
                                 </div>
                               </div>
@@ -1235,7 +1457,8 @@ export default function GajerPeptideApp() {
                             </>
                           )}
                         </button>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -1244,12 +1467,30 @@ export default function GajerPeptideApp() {
                     <div className="rounded-xl p-4" style={{ background: C.card, border: `1px solid ${C.line}` }}>
                       <SectionTitle eyebrow={patientMode ? "Cost to patient" : "Patient price"} title={patientMode ? selectedPeptide.displayName : "Quote breakdown"} />
 
+                      {selectedVendor.unitRecognized === false && doseUnit !== "IU" && (
+                        <div className="mb-3 p-3 rounded-lg text-xs" style={{ background: C.amberSoft, color: C.amber }}>
+                          This product is dosed in <strong>{selectedVendor.rawStrength}</strong> — switch the dose unit toggle above to <strong>IU</strong> to price it.
+                        </div>
+                      )}
+                      {selectedVendor.computed.unitMismatch && (
+                        <div className="mb-3 p-3 rounded-lg text-xs" style={{ background: C.claySoft, color: C.clay }}>
+                          This product is dosed in mg, but the dose unit above is set to IU — switch it back to <strong>mg</strong> to price it.
+                        </div>
+                      )}
+                      {selectedVendor.computed.isStrip && (
+                        <div className="mb-3 p-3 rounded-lg text-xs" style={{ background: C.tealSoft, color: C.tealDark }}>
+                          Strips are dosed 1 per day — the course length alone determines how many are needed; dose amount and frequency above don't change this.
+                        </div>
+                      )}
+
                       {patientMode ? (
                         <>
                           <div className="rounded-lg p-5 mb-4 text-center" style={{ background: C.tealSoft }}>
                             <div className="text-3xl font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{money(patientCost)}</div>
                             <div className="text-xs mt-1" style={{ color: C.inkSoft }}>
-                              {config.doseMg}mg · {config.freqPerWeek}×/week · {config.durationWeeks} weeks
+                              {usePhased
+                                ? phases.map((p, i) => `${p.doseMg}mg × ${p.freqPerWeek}/wk (${p.durationWeeks}wk)`).join(" then ")
+                                : `${config.doseMg}${doseUnit} · ${config.freqPerWeek}×/week · ${config.durationWeeks} weeks`}
                             </div>
                           </div>
                           <div className="flex items-center gap-2 mb-4">
@@ -1861,7 +2102,16 @@ export default function GajerPeptideApp() {
                       <div className="text-sm font-semibold mb-1">{l.name}</div>
                       {fields.protocol && (
                         <div className="text-xs mb-1" style={{ color: C.inkSoft }}>
-                          {l.config.doseMg}mg × {l.config.freqPerWeek}/week for {l.config.durationWeeks} weeks — total {fmtMg(l.totalMg)}
+                          {l.phases && l.phases.length ? (
+                            <>
+                              {l.phases.map((p, pi) => (
+                                <div key={pi}>Phase {pi + 1}: {p.doseMg}mg × {p.freqPerWeek}/week for {p.durationWeeks} weeks</div>
+                              ))}
+                              <div>Total course: {fmtMg(l.totalMg)}</div>
+                            </>
+                          ) : (
+                            <>{l.config.doseMg}mg × {l.config.freqPerWeek}/week for {l.config.durationWeeks} weeks — total {fmtMg(l.totalMg)}</>
+                          )}
                         </div>
                       )}
                       {fields.vendor && <div className="text-xs mb-1" style={{ color: C.inkSoft }}>Product: {l.vendor.format}, {l.vendor.strengthMg}mg ({l.unitsNeeded} unit{l.unitsNeeded === 1 ? "" : "s"})</div>}
