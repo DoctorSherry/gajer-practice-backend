@@ -1,6 +1,6 @@
 const { readRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
-const { rowsToObjects, pickField, toNumber, parseStrengthMg, json, errorResponse, corsHeaders } = require("./_lib/rows");
+const { rowsToObjects, pickField, toNumber, parseStrengthInfo, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
 const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", "peptide name"];
 const FORMAT_KEYS = ["format", "delivery", "type", "delivery format"];
@@ -23,13 +23,22 @@ exports.handler = async (event) => {
     ]);
 
     const vendors = rowsToObjects(vendorRows)
-      .map((r) => ({
-        name: (pickField(r, VENDOR_NAME_KEYS) || "").toString().trim(),
-        format: (pickField(r, FORMAT_KEYS) || "Vial").toString().trim(),
-        strengthMg: parseStrengthMg(pickField(r, STRENGTH_KEYS)),
-        wholesalePrice: toNumber(pickField(r, PRICE_KEYS)),
-      }))
-      .filter((v) => v.name && v.strengthMg > 0 && v.wholesalePrice > 0);
+      .map((r) => {
+        const strengthInfo = parseStrengthInfo(pickField(r, STRENGTH_KEYS));
+        return {
+          name: (pickField(r, VENDOR_NAME_KEYS) || "").toString().trim(),
+          format: (pickField(r, FORMAT_KEYS) || "Vial").toString().trim(),
+          strengthMg: strengthInfo.strengthMg,
+          unitRecognized: strengthInfo.unitRecognized,
+          rawStrength: strengthInfo.rawStrength,
+          rawUnitValue: strengthInfo.rawUnitValue,
+          wholesalePrice: toNumber(pickField(r, PRICE_KEYS)),
+        };
+      })
+      // Keep a row if it has a usable mg strength OR is a flagged non-mg
+      // product (IU etc.) meant for manual entry — only drop rows that are
+      // genuinely broken (no name/price, or a real parsing failure).
+      .filter((v) => v.name && v.wholesalePrice > 0 && (v.strengthMg > 0 || v.unitRecognized === false));
 
     const protocols = rowsToObjects(protocolRows)
       .map((r) => ({
