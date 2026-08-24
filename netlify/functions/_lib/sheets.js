@@ -59,4 +59,28 @@ async function appendRow(spreadsheetId, range, row) {
   });
 }
 
-module.exports = { readRange, appendRow };
+/** Append several rows in one call (one visit producing multiple peptide lines). */
+async function appendRows(spreadsheetId, range, rows) {
+  const sheets = await getClient();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: rows },
+  });
+}
+
+/** Overwrite an exact range (e.g. "Orders!A5:U5") with new values — used to
+ * update a specific existing row in place (Orders tab operational fields). */
+async function updateRange(spreadsheetId, range, values) {
+  const sheets = await getClient();
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range,
+    valueInputOption: "RAW",
+    requestBody: { values: [values] },
+  });
+}
+
+module.exports = { readRange, appendRow, appendRows, updateRange };
