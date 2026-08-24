@@ -330,6 +330,12 @@ export default function GajerPeptideApp() {
   const toastTimers = React.useRef([]);
   const [patientIdError, setPatientIdError] = useState("");
   const [activeTab, setActiveTab] = useState("search");
+  const [allOrders, setAllOrders] = useState([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [ordersError, setOrdersError] = useState("");
+  const [ordersSavingId, setOrdersSavingId] = useState(null);
+  const [ordersFilter, setOrdersFilter] = useState("all"); // all | Consultation Only | Missing Payment | Not Yet Ordered | Awaiting Instructions | Completed
+  const [ordersExpandedId, setOrdersExpandedId] = useState(null);
   const [patientMode, setPatientMode] = useState(false);
 
   const [query, setQuery] = useState("");
@@ -571,6 +577,42 @@ export default function GajerPeptideApp() {
     })();
   }, [activePatientId, idToken]);
 
+  /* ---------- backend: load the shared Orders list ---------- */
+  async function loadOrders() {
+    if (!idToken) return;
+    setOrdersLoading(true);
+    try {
+      const data = await authFetch("/orders");
+      setAllOrders(data.orders || []);
+      setOrdersError("");
+    } catch (err) {
+      setOrdersError(err.message);
+    } finally {
+      setOrdersLoading(false);
+    }
+  }
+  useEffect(() => {
+    if (idToken) loadOrders();
+  }, [idToken]);
+  useEffect(() => {
+    if (activeTab === "orders" && idToken) loadOrders();
+  }, [activeTab, idToken]);
+
+  async function updateOrderField(lineId, patch) {
+    setOrdersSavingId(lineId);
+    // optimistic update so the UI feels immediate
+    setAllOrders((prev) => prev.map((o) => (o.lineId === lineId ? { ...o, ...patch } : o)));
+    try {
+      const result = await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, ...patch }) });
+      setAllOrders((prev) => prev.map((o) => (o.lineId === lineId ? { ...o, status: result.status } : o)));
+    } catch (err) {
+      showToast(`Update failed: ${err.message}`);
+      loadOrders(); // re-sync with the server since the optimistic update may be wrong
+    } finally {
+      setOrdersSavingId(null);
+    }
+  }
+
   // Patient Mode always defaults OFF on a new patient — never carries over.
   useEffect(() => {
     setPatientMode(false);
@@ -598,6 +640,23 @@ export default function GajerPeptideApp() {
         setPatientHistory((prev) => ({ ...prev, [activePatientId]: [saved, ...(prev[activePatientId] || [])] }));
         addPatientIdLocally(activePatientId);
         showToast(`${record.status === "consulted" ? "Consultation" : "Purchase"} saved to ${activePatientId}`);
+        // Parallel write to the shared Orders sheet — one row per peptide,
+        // visible to the whole team for payment/fulfillment tracking.
+        // Failure here doesn't block the save above; it's reported separately.
+        try {
+          await authFetch("/orders", {
+            method: "POST",
+            body: JSON.stringify({
+              patientId: activePatientId,
+              type: record.status === "consulted" ? "consultation" : "purchase",
+              blendName: record.blendName,
+              lines: record.lines,
+            }),
+          });
+          loadOrders();
+        } catch (ordersErr) {
+          showToast(`Saved, but Orders sheet update failed: ${ordersErr.message}`);
+        }
       } catch (err) {
         setPatientIdError(err.message);
       }
@@ -1063,6 +1122,26 @@ export default function GajerPeptideApp() {
         </div>
         <div className="print-hide tgp-brand-rule mb-4" />
 
+        {!patientMode && authProfile && (() => {
+          const pendingCount = allOrders.filter((o) => o.status === "Missing Payment").length;
+          if (pendingCount === 0) return null;
+          return (
+            <button
+              onClick={() => { setActiveTab("orders"); setOrdersFilter("Missing Payment"); }}
+              className="print-hide w-full flex items-center justify-between gap-3 mb-4 px-3 py-2.5 rounded-xl text-left"
+              style={{ background: C.claySoft, border: `1.5px solid ${C.clay}` }}
+            >
+              <div className="flex items-center gap-2.5">
+                <AlertCircle size={16} color={C.clay} />
+                <span className="text-sm font-medium" style={{ color: C.clay }}>
+                  {pendingCount} pending payment{pendingCount === 1 ? "" : "s"} — click to review
+                </span>
+              </div>
+              <span className="text-xs" style={{ color: C.clay }}>Go to Orders →</span>
+            </button>
+          );
+        })()}
+
         {catalogError && (
           <div className="print-hide flex items-center gap-2 mb-4 px-3 py-2 rounded-lg text-sm" style={{ background: C.claySoft, color: C.clay }}>
             <AlertCircle size={15} /> Couldn't load your live catalog ({catalogError}) — showing sample data instead.
@@ -1198,10 +1277,11 @@ export default function GajerPeptideApp() {
             ["plan", "Treatment Plan"],
             ["customblend", "Custom Blend"],
             ["history", "Patient History"],
+            ["orders", "Orders"],
             ["import", "Import Data"],
             ["export", "Export"],
           ]
-            .filter(([key]) => !(patientMode && (key === "history" || key === "import")))
+            .filter(([key]) => !(patientMode && (key === "history" || key === "import" || key === "orders")))
             .map(([key, label]) => (
             <button
               key={key}
@@ -1967,6 +2047,150 @@ export default function GajerPeptideApp() {
             {historyList.length > 0 && (
               <div className="flex items-center gap-1.5 mt-3 text-xs" style={{ color: C.inkSoft }}>
                 <HistoryIcon size={12} /> Records are permanent — nothing here can be edited or deleted; a change creates a new entry.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ===================== ORDERS TAB (shared, editable, whole team) ===================== */}
+        {activeTab === "orders" && (
+          <div className="rounded-xl p-4 tgp-tab-content" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+            <SectionTitle
+              eyebrow="Shared with the whole team"
+              title="Orders — payment & fulfillment"
+              right={
+                <div className="flex items-center gap-2">
+                  <select
+                    value={ordersFilter}
+                    onChange={(e) => setOrdersFilter(e.target.value)}
+                    className="px-2 py-1.5 rounded-md text-sm outline-none"
+                    style={{ border: `1px solid ${C.line}`, color: C.ink, background: C.card }}
+                  >
+                    {["all", "Consultation Only", "Missing Payment", "Not Yet Ordered", "Awaiting Instructions", "Completed"].map((s) => (
+                      <option key={s} value={s}>{s === "all" ? "All statuses" : s}</option>
+                    ))}
+                  </select>
+                  <button onClick={loadOrders} className="text-xs px-2 py-1.5 rounded-md" style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}>
+                    Refresh
+                  </button>
+                </div>
+              }
+            />
+            <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+              Every peptide across every patient, one row each. What was prescribed and charged never changes here — Payment, Ordered, and Instructions Sent are the only editable fields, and any signed-in staff member can update them.
+            </p>
+
+            {ordersLoading && (
+              <div className="flex items-center gap-2 text-sm py-6" style={{ color: C.inkSoft }}>
+                <Loader2 size={15} className="tgp-spin" /> Loading orders…
+              </div>
+            )}
+            {ordersError && !ordersLoading && (
+              <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg text-sm" style={{ background: C.claySoft, color: C.clay }}>
+                <AlertCircle size={15} /> {ordersError}
+              </div>
+            )}
+
+            {!ordersLoading && !ordersError && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${C.line}` }}>
+                      {["Status", "Date", "Patient", "Peptide", "Price", "Payment", "Ordered", "Instr. Sent", "Notes"].map((h) => (
+                        <th key={h} className="text-left px-2 py-2 text-xs" style={{ color: C.inkSoft }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allOrders
+                      .filter((o) => ordersFilter === "all" || o.status === ordersFilter)
+                      .map((o) => {
+                        const saving = ordersSavingId === o.lineId;
+                        const expanded = ordersExpandedId === o.lineId;
+                        return (
+                          <React.Fragment key={o.lineId}>
+                          <tr style={{ borderBottom: expanded ? "none" : `1px solid ${C.line}`, opacity: saving ? 0.6 : 1 }}>
+                            <td className="px-2 py-2"><Tag tone={o.status === "Completed" ? "green" : o.status === "Missing Payment" ? "clay" : "amber"}>{o.status}</Tag></td>
+                            <td className="px-2 py-2 text-xs" style={{ color: C.inkSoft, whiteSpace: "nowrap" }}>{o.date}</td>
+                            <td className="px-2 py-2">
+                              <button
+                                onClick={() => setOrdersExpandedId(expanded ? null : o.lineId)}
+                                className="text-xs font-medium underline"
+                                style={{ color: C.teal }}
+                              >
+                                {o.patient}
+                              </button>
+                            </td>
+                            <td className="px-2 py-2 text-xs" style={{ color: C.inkSoft, maxWidth: 220 }}>{o.peptide}</td>
+                            <td className="px-2 py-2 text-xs font-medium" style={{ fontFamily: FONT_MONO }}>{money(o.patientPrice)}</td>
+                            <td className="px-2 py-2">
+                              {o.type === "purchase" ? (
+                                <select
+                                  value={o.paymentStatus || "pending"}
+                                  onChange={(e) => updateOrderField(o.lineId, { paymentStatus: e.target.value, paymentDate: e.target.value === "paid" ? new Date().toLocaleDateString("en-US") : o.paymentDate })}
+                                  className="text-xs px-1.5 py-1 rounded-md outline-none"
+                                  style={{ border: `1px solid ${C.line}`, background: C.card }}
+                                >
+                                  <option value="pending">Pending</option>
+                                  <option value="paid">Paid</option>
+                                </select>
+                              ) : <span className="text-xs" style={{ color: C.inkSoft }}>—</span>}
+                            </td>
+                            <td className="px-2 py-2 text-center">
+                              <input type="checkbox" checked={o.ordered === "Y"} disabled={o.type !== "purchase"} onChange={(e) => updateOrderField(o.lineId, { ordered: e.target.checked ? "Y" : "N" })} />
+                            </td>
+                            <td className="px-2 py-2 text-center">
+                              <input type="checkbox" checked={o.instructionsSent === "Y"} disabled={o.type !== "purchase"} onChange={(e) => updateOrderField(o.lineId, { instructionsSent: e.target.checked ? "Y" : "N" })} />
+                            </td>
+                            <td className="px-2 py-2">
+                              <input
+                                type="text" defaultValue={o.notes || ""}
+                                onBlur={(e) => { if (e.target.value !== (o.notes || "")) updateOrderField(o.lineId, { notes: e.target.value }); }}
+                                placeholder="—"
+                                className="text-xs px-1.5 py-1 rounded-md outline-none w-32"
+                                style={{ border: `1px solid ${C.line}`, background: C.card }}
+                              />
+                            </td>
+                          </tr>
+                          {expanded && (
+                            <tr style={{ borderBottom: `1px solid ${C.line}` }}>
+                              <td colSpan={9} className="px-4 py-3" style={{ background: C.paper }}>
+                                <div className="grid grid-cols-4 gap-4 text-xs">
+                                  <div><span style={{ color: C.inkSoft }}>Doctor</span><div className="font-medium" style={{ color: C.ink }}>{o.doctor || "—"}</div></div>
+                                  <div><span style={{ color: C.inkSoft }}>Dose</span><div className="font-medium" style={{ color: C.ink, fontFamily: FONT_MONO }}>{o.dose || "—"}</div></div>
+                                  <div><span style={{ color: C.inkSoft }}>Frequency</span><div className="font-medium" style={{ color: C.ink, fontFamily: FONT_MONO }}>{o.frequency ? `${o.frequency}×/week` : "—"}</div></div>
+                                  <div><span style={{ color: C.inkSoft }}>Duration</span><div className="font-medium" style={{ color: C.ink, fontFamily: FONT_MONO }}>{o.duration ? `${o.duration} weeks` : "—"}</div></div>
+                                  <div><span style={{ color: C.inkSoft }}>Units needed</span><div className="font-medium" style={{ color: C.ink }}>{o.units || "—"}</div></div>
+                                  <div><span style={{ color: C.inkSoft }}>Payment date</span><div className="font-medium" style={{ color: C.ink }}>{o.paymentDate || "Not yet paid"}</div></div>
+                                  <div>
+                                    <span style={{ color: C.inkSoft }}>Collection method</span>
+                                    <select
+                                      value={o.collectionMethod || ""}
+                                      onChange={(e) => updateOrderField(o.lineId, { collectionMethod: e.target.value })}
+                                      className="block mt-0.5 text-xs px-1.5 py-1 rounded-md outline-none"
+                                      style={{ border: `1px solid ${C.line}`, background: C.card }}
+                                    >
+                                      <option value="">— not set —</option>
+                                      <option value="Valor Terminal">Valor Terminal</option>
+                                      <option value="Valor - eInvoice">Valor - eInvoice</option>
+                                      <option value="Stripe">Stripe</option>
+                                      <option value="Acuity">Acuity</option>
+                                      <option value="Membership">Membership</option>
+                                      <option value="Cash">Cash</option>
+                                      <option value="Other">Other</option>
+                                    </select>
+                                  </div>
+                                  <div><span style={{ color: C.inkSoft }}>Visit ID</span><div className="font-medium" style={{ color: C.inkSoft, fontFamily: FONT_MONO, fontSize: 10 }}>{o.visitId}</div></div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
+                        );
+                      })}
+                  </tbody>
+                </table>
+                {allOrders.length === 0 && <div className="text-sm text-center py-8" style={{ color: C.inkSoft }}>No orders yet.</div>}
               </div>
             )}
           </div>
