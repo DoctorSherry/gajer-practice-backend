@@ -283,6 +283,40 @@ function StatusToggle({ value, onChange }) {
   );
 }
 
+// Shown next to StatusToggle whenever a Purchase is being saved — lets a
+// doctor flag a tiered/membership patient as getting a recurring monthly
+// supply instead of the whole course at once, with the Orders tab then
+// tracking when each shipment is due.
+function MembershipToggle({ isMembership, onToggle, intervalDays, onIntervalChange, totalShipments, onTotalChange }) {
+  return (
+    <div className="mb-2 p-2 rounded-md" style={{ background: isMembership ? C.tealSoft : "transparent", border: `1px solid ${isMembership ? C.teal : C.line}` }}>
+      <label className="flex items-center gap-2 text-xs" style={{ color: C.inkSoft }}>
+        <input type="checkbox" checked={isMembership} onChange={(e) => onToggle(e.target.checked)} />
+        Membership — ship in installments (e.g. a month's supply at a time) instead of all at once
+      </label>
+      {isMembership && (
+        <div className="flex items-center gap-3 mt-2 text-xs" style={{ color: C.inkSoft }}>
+          <span>Every</span>
+          <input
+            type="number" min="1" value={intervalDays}
+            onChange={(e) => onIntervalChange(parseInt(e.target.value) || 30)}
+            className="w-14 px-2 py-1 rounded-md text-sm outline-none"
+            style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }}
+          />
+          <span>days, for</span>
+          <input
+            type="number" min="1" value={totalShipments}
+            onChange={(e) => onTotalChange(parseInt(e.target.value) || 1)}
+            className="w-14 px-2 py-1 rounded-md text-sm outline-none"
+            style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }}
+          />
+          <span>total shipments</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StatusTag({ status }) {
   if (status === "consulted") return <Tag tone="amber">Consultation only</Tag>;
   return <Tag tone="green">Purchased</Tag>;
@@ -320,8 +354,13 @@ export default function GajerPeptideApp() {
   const [catalogError, setCatalogError] = useState("");
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [recordStatus, setRecordStatus] = useState("purchased"); // "consulted" | "purchased" — set right before saving any quote
+  const [isMembershipSupply, setIsMembershipSupply] = useState(false);
+  const [supplyIntervalDays, setSupplyIntervalDays] = useState(30);
+  const [totalShipments, setTotalShipments] = useState(1);
   const [patientIdInput, setPatientIdInput] = useState("");
   const [showPatientSuggestions, setShowPatientSuggestions] = useState(false);
+  const [showPatientListPanel, setShowPatientListPanel] = useState(false);
+  const [patientListQuery, setPatientListQuery] = useState("");
   const [activePatientId, setActivePatientId] = useState(null);
   const [patientHistory, setPatientHistory] = useState({});
   const [patientIndex, setPatientIndex] = useState([]);
@@ -336,6 +375,7 @@ export default function GajerPeptideApp() {
   const [ordersSavingId, setOrdersSavingId] = useState(null);
   const [ordersFilter, setOrdersFilter] = useState("all"); // all | Consultation Only | Missing Payment | Not Yet Ordered | Awaiting Instructions | Completed
   const [ordersExpandedId, setOrdersExpandedId] = useState(null);
+  const [ordersSortMode, setOrdersSortMode] = useState("status"); // "status" | "shipmentDue"
   const [patientMode, setPatientMode] = useState(false);
 
   const [query, setQuery] = useState("");
@@ -613,6 +653,22 @@ export default function GajerPeptideApp() {
     }
   }
 
+  async function markShipmentSent(lineId) {
+    setOrdersSavingId(lineId);
+    try {
+      const result = await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, markShipmentSent: true }) });
+      setAllOrders((prev) => prev.map((o) => (o.lineId === lineId
+        ? { ...o, shipmentsSent: result.shipmentsSent, nextShipDue: result.nextShipDue, shipmentStatus: result.shipmentStatus }
+        : o)));
+      showToast(result.shipmentStatus === "Membership Complete" ? "Final shipment recorded — membership complete" : "Shipment recorded, next one scheduled");
+    } catch (err) {
+      showToast(`Couldn't record shipment: ${err.message}`);
+      loadOrders();
+    } finally {
+      setOrdersSavingId(null);
+    }
+  }
+
   // Patient Mode always defaults OFF on a new patient — never carries over.
   useEffect(() => {
     setPatientMode(false);
@@ -757,6 +813,9 @@ export default function GajerPeptideApp() {
     resetBlendBuilder();
     setExportRecord(null);
     setRecordStatus("purchased");
+    setIsMembershipSupply(false);
+    setSupplyIntervalDays(30);
+    setTotalShipments(1);
     setActiveTab("search");
   }
 
@@ -774,6 +833,9 @@ export default function GajerPeptideApp() {
       multiplier,
       flatOverride: useFlat ? flatOverride : null,
       patientCost,
+      isMembership: recordStatus === "purchased" && isMembershipSupply,
+      supplyIntervalDays,
+      totalShipments,
     };
   }
 
@@ -906,6 +968,9 @@ export default function GajerPeptideApp() {
       multiplier: blendMultiplier,
       flatOverride: null,
       patientCost: c.computed.costOffice * blendMultiplier,
+      isMembership: recordStatus === "purchased" && isMembershipSupply,
+      supplyIntervalDays,
+      totalShipments,
     }));
   }
 
@@ -1142,6 +1207,26 @@ export default function GajerPeptideApp() {
           );
         })()}
 
+        {!patientMode && authProfile && (() => {
+          const dueCount = allOrders.filter((o) => o.shipmentStatus === "Due Today" || o.shipmentStatus === "Overdue").length;
+          if (dueCount === 0) return null;
+          return (
+            <button
+              onClick={() => { setActiveTab("orders"); setOrdersFilter("all"); setOrdersSortMode("shipmentDue"); }}
+              className="print-hide w-full flex items-center justify-between gap-3 mb-4 px-3 py-2.5 rounded-xl text-left"
+              style={{ background: C.amberSoft, border: `1.5px solid ${C.amber}` }}
+            >
+              <div className="flex items-center gap-2.5">
+                <AlertCircle size={16} color={C.amber} />
+                <span className="text-sm font-medium" style={{ color: C.amber }}>
+                  {dueCount} membership shipment{dueCount === 1 ? "" : "s"} due — click to review
+                </span>
+              </div>
+              <span className="text-xs" style={{ color: C.amber }}>Go to Orders →</span>
+            </button>
+          );
+        })()}
+
         {catalogError && (
           <div className="print-hide flex items-center gap-2 mb-4 px-3 py-2 rounded-lg text-sm" style={{ background: C.claySoft, color: C.clay }}>
             <AlertCircle size={15} /> Couldn't load your live catalog ({catalogError}) — showing sample data instead.
@@ -1230,12 +1315,53 @@ export default function GajerPeptideApp() {
               </>
             )}
           </div>
-          <div className="flex items-center justify-between mt-1.5">
+          <div className="flex items-center justify-between mt-1.5 relative">
             <div className="text-xs" style={{ color: patientIdError ? C.clay : C.inkSoft }}>
               {patientIdError || "Type an ID and click \u201cCreate new patient\u201d, leave it blank to auto-generate one, or \u201cFind existing\u201d to pull up a saved record."}
             </div>
             {patientIndex.length > 0 && (
-              <div className="text-xs" style={{ color: C.inkSoft }}>{patientIndex.length} patient{patientIndex.length === 1 ? "" : "s"} on file</div>
+              <button
+                onClick={() => setShowPatientListPanel((v) => !v)}
+                className="text-xs underline"
+                style={{ color: C.teal }}
+              >
+                {patientIndex.length} patient{patientIndex.length === 1 ? "" : "s"} on file — view all
+              </button>
+            )}
+            {showPatientListPanel && (
+              <div
+                className="absolute right-0 top-6 w-72 rounded-lg overflow-hidden z-20"
+                style={{ background: C.card, border: `1px solid ${C.line}`, boxShadow: "0 6px 20px rgba(30,27,23,0.15)" }}
+              >
+                <div className="p-2" style={{ borderBottom: `1px solid ${C.line}` }}>
+                  <input
+                    autoFocus
+                    value={patientListQuery}
+                    onChange={(e) => setPatientListQuery(e.target.value)}
+                    placeholder="Filter patients…"
+                    className="w-full px-2 py-1 rounded-md text-sm outline-none"
+                    style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }}
+                  />
+                </div>
+                <div className="max-h-72 overflow-y-auto">
+                  {patientIndex
+                    .filter((id) => !patientListQuery.trim() || id.toLowerCase().includes(patientListQuery.trim().toLowerCase()))
+                    .map((id) => (
+                      <button
+                        key={id}
+                        onClick={() => { loadExistingPatient(id); setShowPatientListPanel(false); setPatientListQuery(""); }}
+                        className="w-full text-left px-3 py-1.5 text-sm tgp-row-hover flex items-center justify-between"
+                        style={{ color: id === activePatientId ? C.teal : C.ink, fontFamily: FONT_MONO }}
+                      >
+                        {id}
+                        {id === activePatientId && <CheckCircle2 size={13} color={C.teal} />}
+                      </button>
+                    ))}
+                  {patientIndex.filter((id) => !patientListQuery.trim() || id.toLowerCase().includes(patientListQuery.trim().toLowerCase())).length === 0 && (
+                    <div className="text-xs px-3 py-3" style={{ color: C.inkSoft }}>No patients match.</div>
+                  )}
+                </div>
+              </div>
             )}
           </div>
         </div>
@@ -1627,7 +1753,18 @@ export default function GajerPeptideApp() {
                         </>
                       )}
 
-                      {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                      {!patientMode && (
+                        <>
+                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
+                          {recordStatus === "purchased" && (
+                            <MembershipToggle
+                              isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
+                              intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
+                              totalShipments={totalShipments} onTotalChange={setTotalShipments}
+                            />
+                          )}
+                        </>
+                      )}
                       <div className="flex gap-2">
                         <button onClick={addToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: C.successSoft, color: C.success }}>
                           <Plus size={14} /> Add to treatment plan
@@ -1729,7 +1866,18 @@ export default function GajerPeptideApp() {
                       {!patientMode && <div className="text-xs" style={{ color: C.tealDark }}>office cost {money(planTotals.office)}</div>}
                     </div>
                   </div>
-                  {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                  {!patientMode && (
+                        <>
+                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
+                          {recordStatus === "purchased" && (
+                            <MembershipToggle
+                              isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
+                              intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
+                              totalShipments={totalShipments} onTotalChange={setTotalShipments}
+                            />
+                          )}
+                        </>
+                      )}
                   <div className="flex gap-2 mt-3">
                     <button onClick={savePlanQuote} disabled={!activePatientId} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
                       <Save size={14} /> Save treatment plan to patient
@@ -1958,7 +2106,18 @@ export default function GajerPeptideApp() {
                       </>
                     )}
 
-                    {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                    {!patientMode && (
+                        <>
+                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
+                          {recordStatus === "purchased" && (
+                            <MembershipToggle
+                              isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
+                              intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
+                              totalShipments={totalShipments} onTotalChange={setTotalShipments}
+                            />
+                          )}
+                        </>
+                      )}
                     <div className="flex flex-wrap gap-2">
                       <button onClick={addBlendToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: C.successSoft, color: C.success }}>
                         <Plus size={14} /> Add blend to treatment plan
@@ -2060,6 +2219,18 @@ export default function GajerPeptideApp() {
               title="Orders — payment & fulfillment"
               right={
                 <div className="flex items-center gap-2">
+                  <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+                    {[["status", "Sort by status"], ["shipmentDue", "Sort by shipment due"]].map(([v, label]) => (
+                      <button
+                        key={v}
+                        onClick={() => setOrdersSortMode(v)}
+                        className="px-2.5 py-1.5 text-xs font-medium"
+                        style={{ background: ordersSortMode === v ? C.teal : "transparent", color: ordersSortMode === v ? "white" : C.inkSoft }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                   <select
                     value={ordersFilter}
                     onChange={(e) => setOrdersFilter(e.target.value)}
@@ -2077,7 +2248,7 @@ export default function GajerPeptideApp() {
               }
             />
             <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
-              Every peptide across every patient, one row each. What was prescribed and charged never changes here — Payment, Ordered, and Instructions Sent are the only editable fields, and any signed-in staff member can update them.
+              Every peptide across every patient, one row each. What was prescribed and charged never changes here — Payment, Ordered, Instructions Sent, and membership shipments are the only editable/advanceable fields, and any signed-in staff member can update them.
             </p>
 
             {ordersLoading && (
@@ -2096,7 +2267,7 @@ export default function GajerPeptideApp() {
                 <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: `1px solid ${C.line}` }}>
-                      {["Status", "Date", "Patient", "Peptide", "Price", "Payment", "Ordered", "Instr. Sent", "Notes"].map((h) => (
+                      {["Status", "Date", "Patient", "Peptide", "Price", "Payment", "Ordered", "Instr. Sent", "Shipment", "Notes"].map((h) => (
                         <th key={h} className="text-left px-2 py-2 text-xs" style={{ color: C.inkSoft }}>{h}</th>
                       ))}
                     </tr>
@@ -2104,6 +2275,15 @@ export default function GajerPeptideApp() {
                   <tbody>
                     {allOrders
                       .filter((o) => ordersFilter === "all" || o.status === ordersFilter)
+                      .slice()
+                      .sort((a, b) => {
+                        if (ordersSortMode !== "shipmentDue") return 0; // keep existing newest-first order from the API
+                        const rank = { "Overdue": 0, "Due Today": 1, "Due Soon": 2, "Scheduled": 3, "Membership Complete": 5 };
+                        const ra = a.shipmentStatus ? (rank[a.shipmentStatus] ?? 4) : 4;
+                        const rb = b.shipmentStatus ? (rank[b.shipmentStatus] ?? 4) : 4;
+                        if (ra !== rb) return ra - rb;
+                        return new Date(a.nextShipDue || 0) - new Date(b.nextShipDue || 0);
+                      })
                       .map((o) => {
                         const saving = ordersSavingId === o.lineId;
                         const expanded = ordersExpandedId === o.lineId;
@@ -2143,6 +2323,16 @@ export default function GajerPeptideApp() {
                               <input type="checkbox" checked={o.instructionsSent === "Y"} disabled={o.type !== "purchase"} onChange={(e) => updateOrderField(o.lineId, { instructionsSent: e.target.checked ? "Y" : "N" })} />
                             </td>
                             <td className="px-2 py-2">
+                              {o.isMembership === "Y" ? (
+                                <div className="flex flex-col gap-0.5">
+                                  <Tag tone={o.shipmentStatus === "Overdue" ? "clay" : (o.shipmentStatus === "Due Today" || o.shipmentStatus === "Due Soon") ? "amber" : o.shipmentStatus === "Membership Complete" ? "green" : "teal"}>
+                                    {o.shipmentStatus}
+                                  </Tag>
+                                  <span className="text-xs" style={{ color: C.inkSoft }}>{o.shipmentsSent}/{o.totalShipments} sent</span>
+                                </div>
+                              ) : <span className="text-xs" style={{ color: C.inkSoft }}>—</span>}
+                            </td>
+                            <td className="px-2 py-2">
                               <input
                                 type="text" defaultValue={o.notes || ""}
                                 onBlur={(e) => { if (e.target.value !== (o.notes || "")) updateOrderField(o.lineId, { notes: e.target.value }); }}
@@ -2154,7 +2344,24 @@ export default function GajerPeptideApp() {
                           </tr>
                           {expanded && (
                             <tr style={{ borderBottom: `1px solid ${C.line}` }}>
-                              <td colSpan={9} className="px-4 py-3" style={{ background: C.paper }}>
+                              <td colSpan={10} className="px-4 py-3" style={{ background: C.paper }}>
+                                {o.isMembership === "Y" && (
+                                  <div className="mb-3 p-2.5 rounded-lg flex items-center justify-between gap-3" style={{ background: C.tealSoft }}>
+                                    <div className="text-xs" style={{ color: C.tealDark }}>
+                                      <strong>Membership supply:</strong> every {o.supplyIntervalDays} days, {o.shipmentsSent} of {o.totalShipments} shipments sent
+                                      {o.nextShipDue && o.shipmentStatus !== "Membership Complete" && <> — next due <strong>{o.nextShipDue}</strong></>}
+                                    </div>
+                                    {o.shipmentStatus !== "Membership Complete" && (
+                                      <button
+                                        onClick={() => markShipmentSent(o.lineId)}
+                                        className="text-xs px-3 py-1.5 rounded-md font-medium whitespace-nowrap"
+                                        style={{ background: C.success, color: "white" }}
+                                      >
+                                        Mark shipment sent
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
                                 <div className="grid grid-cols-4 gap-4 text-xs">
                                   <div><span style={{ color: C.inkSoft }}>Doctor</span><div className="font-medium" style={{ color: C.ink }}>{o.doctor || "—"}</div></div>
                                   <div><span style={{ color: C.inkSoft }}>Dose</span><div className="font-medium" style={{ color: C.ink, fontFamily: FONT_MONO }}>{o.dose || "—"}</div></div>
