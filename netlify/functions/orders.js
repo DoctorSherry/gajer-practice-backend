@@ -8,14 +8,14 @@ const ORDERS_RANGE = process.env.ORDERS_RANGE || "Orders";
 // Orders tab header row (one row per peptide, shared across the whole team):
 //   Status | Date | Patient | Peptide | Dose | Frequency | Duration | Units | Patient Price |
 //   Type | Payment Status | Payment Date | Collection Method | Ordered | Instructions Sent | Notes | Doctor | LineID | VisitID |
-//   Is Membership | Supply Interval Days | Total Shipments | Shipments Sent | Next Ship Due
-// The last 5 columns are new — add them to your existing Orders tab header row
+//   Is Membership | Supply Interval Days | Total Shipments | Shipments Sent | Next Ship Due | Last Shipment By
+// The last 6 columns are new — add them to your existing Orders tab header row
 // (don't reorder the earlier ones; existing rows already match those positions).
 const COLUMNS = [
   "Status", "Date", "Patient", "Peptide", "Dose", "Frequency", "Duration", "Units",
   "Patient Price", "Type", "Payment Status", "Payment Date",
   "Collection Method", "Ordered", "Instructions Sent", "Notes", "Doctor", "LineID", "VisitID",
-  "Is Membership", "Supply Interval Days", "Total Shipments", "Shipments Sent", "Next Ship Due",
+  "Is Membership", "Supply Interval Days", "Total Shipments", "Shipments Sent", "Next Ship Due", "Last Shipment By",
 ];
 
 /** Turns Type/Payment/Ordered/Instructions into one glance-able status word —
@@ -46,6 +46,13 @@ function computeShipmentStatus(f, todayStr) {
   return "Scheduled";
 }
 
+
+/** Whole number >= 1; anything else keeps the old value (guards typos like 0 or -3). */
+function clampPositiveInt(value, fallback) {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+
 function rowFromFields(f) {
   const status = computeStatus(f);
   return [
@@ -54,6 +61,7 @@ function rowFromFields(f) {
     f.collectionMethod || "", f.ordered || "N", f.instructionsSent || "N", f.notes || "",
     f.doctor, f.lineId, f.visitId,
     f.isMembership || "N", f.supplyIntervalDays || "", f.totalShipments || "", f.shipmentsSent || 0, f.nextShipDue || "",
+    f.lastShipmentBy || "",
   ];
 }
 
@@ -70,6 +78,7 @@ function fieldsFromRow(r) {
     totalShipments: Number(r["Total Shipments"]) || 0,
     shipmentsSent: Number(r["Shipments Sent"]) || 0,
     nextShipDue: r["Next Ship Due"] || "",
+    lastShipmentBy: r["Last Shipment By"] || "",
   };
 }
 
@@ -128,7 +137,7 @@ exports.handler = async (event) => {
 
     if (event.httpMethod === "PATCH") {
       const body = JSON.parse(event.body || "{}");
-      const { lineId, paymentStatus, paymentDate, collectionMethod, ordered, instructionsSent, notes, type, markShipmentSent } = body;
+      const { lineId, paymentStatus, paymentDate, collectionMethod, ordered, instructionsSent, notes, type, markShipmentSent, totalShipments, supplyIntervalDays } = body;
       if (!lineId) return json(400, { error: "lineId is required" });
 
       const rawRows = await readRange(process.env.APP_DATA_SHEET_ID, ORDERS_RANGE);
@@ -146,20 +155,45 @@ exports.handler = async (event) => {
         ...(ordered !== undefined ? { ordered } : {}),
         ...(instructionsSent !== undefined ? { instructionsSent } : {}),
         ...(notes !== undefined ? { notes } : {}),
+        // Fixing a typo'd shipment count/interval after the fact — doesn't
+        // touch shipmentsSent or the already-scheduled next due date.
+        ...(totalShipments !== undefined ? { totalShipments: clampPositiveInt(totalShipments, existing.totalShipments) } : {}),
+        ...(supplyIntervalDays !== undefined ? { supplyIntervalDays: clampPositiveInt(supplyIntervalDays, existing.supplyIntervalDays) } : {}),
       };
+
+      // If a typo'd total was raised after the course already finished, the
+      // order is active again — schedule the next shipment so it has a due date.
+      const todayStr = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" });
+      if (
+        existing.isMembership === "Y" &&
+        totalShipments !== undefined &&
+        !existing.nextShipDue &&
+        Number(updated.shipmentsSent) < Number(updated.totalShipments)
+      ) {
+        updated.nextShipDue = new Date(Date.now() + (Number(updated.supplyIntervalDays) || 30) * 86400000)
+          .toLocaleDateString("en-US", { timeZone: "America/New_York" });
+      }
+      // If the total was lowered to what's already been sent, nothing more is due.
+      if (existing.isMembership === "Y" && Number(updated.shipmentsSent) >= Number(updated.totalShipments)) {
+        updated.nextShipDue = "";
+      }
 
       // "Mark shipment sent" is computed from the CURRENT sheet state, not
       // whatever the client last saw — two people clicking it moments apart
       // still each advance the count by exactly one, never skip or double up.
-      if (markShipmentSent && existing.isMembership === "Y") {
+      // Already fully shipped (e.g. two people clicked the last one together):
+      // do nothing — never push the count past the total.
+      const alreadyComplete = existing.isMembership === "Y" && Number(existing.totalShipments) > 0 &&
+        Number(existing.shipmentsSent) >= Number(existing.totalShipments);
+      if (markShipmentSent && existing.isMembership === "Y" && !alreadyComplete) {
         const sentCount = (Number(existing.shipmentsSent) || 0) + 1;
         const total = Number(existing.totalShipments) || 0;
-        const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" });
         updated.shipmentsSent = sentCount;
         updated.nextShipDue = sentCount >= total
           ? ""
           : new Date(Date.now() + (Number(existing.supplyIntervalDays) || 30) * 86400000)
               .toLocaleDateString("en-US", { timeZone: "America/New_York" });
+        updated.lastShipmentBy = `${doctor.name} · ${todayStr}`; // name from verified sign-in, never client-supplied
       }
 
       const sheetRowNumber = rowIndex + 2; // +1 for header row, +1 for 1-based indexing
@@ -172,6 +206,9 @@ exports.handler = async (event) => {
         shipmentsSent: updated.shipmentsSent,
         nextShipDue: updated.nextShipDue,
         shipmentStatus: computeShipmentStatus(updated),
+        totalShipments: updated.totalShipments,
+        supplyIntervalDays: updated.supplyIntervalDays,
+        lastShipmentBy: updated.lastShipmentBy,
       });
     }
 
