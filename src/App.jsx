@@ -98,6 +98,13 @@ const money = (n) =>
   isFinite(n) ? n.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "—";
 const fmtMg = (n) => `${(Math.round(n * 100) / 100).toString()} mg`;
 
+// A membership is "finished" only when every shipment is out AND the order is
+// fully done (paid, ordered, instructions sent) — an unpaid finished course
+// must stay visible so nobody forgets to collect.
+function isFinishedMembership(o) {
+  return o.isMembership === "Y" && o.shipmentStatus === "Membership Complete" && o.status === "Completed";
+}
+
 const STRIPS_PER_BOX = 30; // the sheet's price/strength for "Strip" items describes a whole box, not one strip
 
 function buildDatabase(vendors, protocols) {
@@ -353,6 +360,8 @@ export default function GajerPeptideApp() {
   const [authError, setAuthError] = useState("");
   const [catalogError, setCatalogError] = useState("");
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false); // blocks double-clicks while a save is in flight
+  const savingRef = React.useRef(false);
   const [recordStatus, setRecordStatus] = useState("purchased"); // "consulted" | "purchased" — set right before saving any quote
   const [isMembershipSupply, setIsMembershipSupply] = useState(false);
   const [supplyIntervalDays, setSupplyIntervalDays] = useState(30);
@@ -376,6 +385,7 @@ export default function GajerPeptideApp() {
   const [ordersFilter, setOrdersFilter] = useState("all"); // all | Consultation Only | Missing Payment | Not Yet Ordered | Awaiting Instructions | Completed
   const [ordersExpandedId, setOrdersExpandedId] = useState(null);
   const [ordersSortMode, setOrdersSortMode] = useState("status"); // "status" | "shipmentDue"
+  const [showFinishedMemberships, setShowFinishedMemberships] = useState(false);
   const [patientMode, setPatientMode] = useState(false);
 
   const [query, setQuery] = useState("");
@@ -644,7 +654,15 @@ export default function GajerPeptideApp() {
     setAllOrders((prev) => prev.map((o) => (o.lineId === lineId ? { ...o, ...patch } : o)));
     try {
       const result = await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, ...patch }) });
-      setAllOrders((prev) => prev.map((o) => (o.lineId === lineId ? { ...o, status: result.status } : o)));
+      setAllOrders((prev) => prev.map((o) => (o.lineId === lineId ? {
+        ...o,
+        status: result.status,
+        shipmentStatus: result.shipmentStatus ?? o.shipmentStatus,
+        totalShipments: result.totalShipments ?? o.totalShipments,
+        supplyIntervalDays: result.supplyIntervalDays ?? o.supplyIntervalDays,
+        shipmentsSent: result.shipmentsSent ?? o.shipmentsSent,
+        nextShipDue: result.nextShipDue ?? o.nextShipDue,
+      } : o)));
     } catch (err) {
       showToast(`Update failed: ${err.message}`);
       loadOrders(); // re-sync with the server since the optimistic update may be wrong
@@ -658,9 +676,13 @@ export default function GajerPeptideApp() {
     try {
       const result = await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, markShipmentSent: true }) });
       setAllOrders((prev) => prev.map((o) => (o.lineId === lineId
-        ? { ...o, shipmentsSent: result.shipmentsSent, nextShipDue: result.nextShipDue, shipmentStatus: result.shipmentStatus }
+        ? { ...o, shipmentsSent: result.shipmentsSent, nextShipDue: result.nextShipDue, shipmentStatus: result.shipmentStatus, lastShipmentBy: result.lastShipmentBy, status: result.status ?? o.status }
         : o)));
-      showToast(result.shipmentStatus === "Membership Complete" ? "Final shipment recorded — membership complete" : "Shipment recorded, next one scheduled");
+      const justFinished = result.shipmentStatus === "Membership Complete";
+      const nowHidden = justFinished && result.status === "Completed";
+      showToast(nowHidden
+        ? "Final shipment recorded — membership complete (find it under “Show finished memberships”)"
+        : justFinished ? "Final shipment recorded — membership complete" : "Shipment recorded, next one scheduled");
     } catch (err) {
       showToast(`Couldn't record shipment: ${err.message}`);
       loadOrders();
@@ -686,8 +708,12 @@ export default function GajerPeptideApp() {
 
   const saveRecord = useCallback(
     async (record) => {
-      if (!activePatientId) return;
-      if (!idToken) { setPatientIdError("Please sign in with Google first."); return; }
+      if (!activePatientId) return false;
+      if (!idToken) { setPatientIdError("Please sign in with Google first."); return false; }
+      if (savingRef.current) return false; // a save is already running — ignore the extra click
+      savingRef.current = true;
+      setIsSaving(true);
+      let ok = false;
       try {
         const saved = await authFetch("/quotes", {
           method: "POST",
@@ -695,6 +721,7 @@ export default function GajerPeptideApp() {
         });
         setPatientHistory((prev) => ({ ...prev, [activePatientId]: [saved, ...(prev[activePatientId] || [])] }));
         addPatientIdLocally(activePatientId);
+        ok = true;
         showToast(`${record.status === "consulted" ? "Consultation" : "Purchase"} saved to ${activePatientId}`);
         // Parallel write to the shared Orders sheet — one row per peptide,
         // visible to the whole team for payment/fulfillment tracking.
@@ -715,7 +742,11 @@ export default function GajerPeptideApp() {
         }
       } catch (err) {
         setPatientIdError(err.message);
+      } finally {
+        savingRef.current = false;
+        setIsSaving(false);
       }
+      return ok;
     },
     [activePatientId, idToken]
   );
@@ -908,16 +939,16 @@ export default function GajerPeptideApp() {
     { office: 0, patient: 0 }
   );
 
-  function saveSingleQuote() {
+  async function saveSingleQuote() {
     if (!selectedPeptide || !selectedVendor || !activePatientId) return;
-    saveRecord({ type: "single", status: recordStatus, lines: [currentLineSnapshot()], totalOffice: officeCost, totalPatient: patientCost });
+    await saveRecord({ type: "single", status: recordStatus, lines: [currentLineSnapshot()], totalOffice: officeCost, totalPatient: patientCost });
   }
 
-  function savePlanQuote() {
+  async function savePlanQuote() {
     if (!planCart.length || !activePatientId) return;
     const lines = flattenPlanCartForSave(planCart);
-    saveRecord({ type: "plan", status: recordStatus, lines, totalOffice: planTotals.office, totalPatient: planTotals.patient });
-    setPlanCart([]);
+    const ok = await saveRecord({ type: "plan", status: recordStatus, lines, totalOffice: planTotals.office, totalPatient: planTotals.patient });
+    if (ok) setPlanCart([]); // only clear once it actually saved, so a failed save loses nothing
   }
 
   /* ---------- Custom Blend builder logic ---------- */
@@ -974,9 +1005,9 @@ export default function GajerPeptideApp() {
     }));
   }
 
-  function saveCustomBlendQuote() {
+  async function saveCustomBlendQuote() {
     if (!blendComponents.length || !activePatientId) return;
-    saveRecord({
+    const ok = await saveRecord({
       type: "customblend",
       status: recordStatus,
       blendName: blendDisplayName,
@@ -985,7 +1016,7 @@ export default function GajerPeptideApp() {
       totalOffice: blendOfficeTotal,
       totalPatient: blendPatientTotal,
     });
-    resetBlendBuilder();
+    if (ok) resetBlendBuilder();
   }
 
   function addBlendToPlan() {
@@ -1771,11 +1802,11 @@ export default function GajerPeptideApp() {
                         </button>
                         <button
                           onClick={saveSingleQuote}
-                          disabled={!activePatientId}
+                          disabled={!activePatientId || isSaving}
                           className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40"
                           style={{ background: C.success, color: "white" }}
                         >
-                          <Save size={14} /> Save quote to patient
+                          <Save size={14} /> {isSaving ? "Saving…" : "Save quote to patient"}
                         </button>
                         {!activePatientId && <span className="text-xs self-center" style={{ color: C.clay }}>Enter a patient ID above first.</span>}
                       </div>
@@ -1879,8 +1910,8 @@ export default function GajerPeptideApp() {
                         </>
                       )}
                   <div className="flex gap-2 mt-3">
-                    <button onClick={savePlanQuote} disabled={!activePatientId} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
-                      <Save size={14} /> Save treatment plan to patient
+                    <button onClick={savePlanQuote} disabled={!activePatientId || isSaving} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
+                      <Save size={14} /> {isSaving ? "Saving…" : "Save treatment plan to patient"}
                     </button>
                     <button onClick={() => setPlanCart([])} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}>
                       <Trash2 size={14} /> Clear plan
@@ -2122,8 +2153,8 @@ export default function GajerPeptideApp() {
                       <button onClick={addBlendToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: C.successSoft, color: C.success }}>
                         <Plus size={14} /> Add blend to treatment plan
                       </button>
-                      <button onClick={saveCustomBlendQuote} disabled={!activePatientId} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
-                        <Save size={14} /> Save blend directly to patient
+                      <button onClick={saveCustomBlendQuote} disabled={!activePatientId || isSaving} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
+                        <Save size={14} /> {isSaving ? "Saving…" : "Save blend directly to patient"}
                       </button>
                       <button onClick={saveBlendTemplate} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ border: `1px solid ${C.amber}`, color: C.amber, background: C.amberSoft }}>
                         Save as reusable template
@@ -2219,6 +2250,12 @@ export default function GajerPeptideApp() {
               title="Orders — payment & fulfillment"
               right={
                 <div className="flex items-center gap-2">
+                  {(allOrders.some(isFinishedMembership) || showFinishedMemberships) && (
+                    <label className="flex items-center gap-1.5 text-xs" style={{ color: C.inkSoft }}>
+                      <input type="checkbox" checked={showFinishedMemberships} onChange={(e) => setShowFinishedMemberships(e.target.checked)} />
+                      Show finished memberships ({allOrders.filter(isFinishedMembership).length})
+                    </label>
+                  )}
                   <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
                     {[["status", "Sort by status"], ["shipmentDue", "Sort by shipment due"]].map(([v, label]) => (
                       <button
@@ -2275,6 +2312,7 @@ export default function GajerPeptideApp() {
                   <tbody>
                     {allOrders
                       .filter((o) => ordersFilter === "all" || o.status === ordersFilter)
+                      .filter((o) => showFinishedMemberships || !isFinishedMembership(o))
                       .slice()
                       .sort((a, b) => {
                         if (ordersSortMode !== "shipmentDue") return 0; // keep existing newest-first order from the API
@@ -2348,8 +2386,30 @@ export default function GajerPeptideApp() {
                                 {o.isMembership === "Y" && (
                                   <div className="mb-3 p-2.5 rounded-lg flex items-center justify-between gap-3" style={{ background: C.tealSoft }}>
                                     <div className="text-xs" style={{ color: C.tealDark }}>
-                                      <strong>Membership supply:</strong> every {o.supplyIntervalDays} days, {o.shipmentsSent} of {o.totalShipments} shipments sent
-                                      {o.nextShipDue && o.shipmentStatus !== "Membership Complete" && <> — next due <strong>{o.nextShipDue}</strong></>}
+                                      <div>
+                                        <strong>Membership supply:</strong> {o.shipmentsSent} of {o.totalShipments} shipments sent
+                                        {o.nextShipDue && o.shipmentStatus !== "Membership Complete" && <> — next due <strong>{o.nextShipDue}</strong></>}
+                                      </div>
+                                      <div className="flex items-center gap-1.5 mt-1.5">
+                                        <span>Fix a mistake: every</span>
+                                        <input
+                                          type="number" min="1" defaultValue={o.supplyIntervalDays}
+                                          key={`int-${o.lineId}-${o.supplyIntervalDays}`}
+                                          onBlur={(e) => { const v = parseInt(e.target.value); if (v >= 1 && v !== o.supplyIntervalDays) updateOrderField(o.lineId, { supplyIntervalDays: v }); }}
+                                          className="w-14 px-1.5 py-0.5 rounded-md text-xs outline-none"
+                                          style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, background: C.card }}
+                                        />
+                                        <span>days, for</span>
+                                        <input
+                                          type="number" min="1" defaultValue={o.totalShipments}
+                                          key={`tot-${o.lineId}-${o.totalShipments}`}
+                                          onBlur={(e) => { const v = parseInt(e.target.value); if (v >= 1 && v !== o.totalShipments) updateOrderField(o.lineId, { totalShipments: v }); }}
+                                          className="w-14 px-1.5 py-0.5 rounded-md text-xs outline-none"
+                                          style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, background: C.card }}
+                                        />
+                                        <span>total shipments</span>
+                                      </div>
+                                      {o.lastShipmentBy && <div className="mt-1.5" style={{ color: C.inkSoft }}>Last shipment marked sent by {o.lastShipmentBy}</div>}
                                     </div>
                                     {o.shipmentStatus !== "Membership Complete" && (
                                       <button
