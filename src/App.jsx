@@ -143,12 +143,13 @@ function scaleLinesTo(lines, target) {
 
 // <TIER-LOGIC>
 // Membership tiers (Patrick, Oct 2026): Tier 1 = 10% off everything. Tier 2 = the most
-// expensive item is covered, the rest 10% off. Tier 3 = the three most expensive items are
-// covered, the rest 10% off. Covered items ship one month at a time; everything else is
+// expensive item is covered, the rest full price. Tier 3 = the three most expensive items are
+// covered, the rest full price. Covered items ship one month at a time; everything else is
 // bought as a full course.
 const TIER_LABELS = ["No membership", "Tier 1", "Tier 2", "Tier 3"];
 const TIER_COVERED_COUNT = [0, 0, 1, 3];
-const TIER_PERCENT_OFF = 10;
+const TIER_PERCENT_OFF = 10; // Tier 1 only; Tier 2/3 pay full price for what is not covered
+const tierPercentFor = (t) => (clampTier(t) === 1 ? TIER_PERCENT_OFF : 0);
 function clampTier(t) {
   const n = Math.round(Number(t));
   return n >= 0 && n <= 3 ? n : 0;
@@ -167,13 +168,13 @@ function tierPricing(prices, tier) {
     const r = out[i];
     if (r.price <= 0) return;
     if (freeLeft > 0) { freeLeft--; r.covered = true; r.final = 0; r.off = r.price; return; }
-    r.off = Math.round(r.price * TIER_PERCENT_OFF) / 100;
+    r.off = Math.round(r.price * tierPercentFor(t)) / 100;
     r.final = Math.round((r.price - r.off) * 100) / 100;
   });
   return out;
 }
 function tierLine(tier, r) {
-  return r.covered ? `${TIER_LABELS[tier]} membership — covered` : `${TIER_LABELS[tier]} membership — ${TIER_PERCENT_OFF}% off`;
+  return r.covered ? `${TIER_LABELS[tier]} membership — covered` : (tierPercentFor(tier) ? `${TIER_LABELS[tier]} membership — ${tierPercentFor(tier)}% off` : `${TIER_LABELS[tier]} membership`);
 }
 // What gets saved on a line so Orders and History know why it costs what it does.
 function tierMetaOf(tier, covered, priceBeforeTier) {
