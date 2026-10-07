@@ -8,7 +8,7 @@ const ORDERS_RANGE = process.env.ORDERS_RANGE || "Orders";
 // Orders tab header row (one row per peptide, shared across the whole team):
 //   Status | Date | Patient | Peptide | Dose | Frequency | Duration | Units | Patient Price |
 //   Type | Payment Status | Payment Date | Collection Method | Ordered | Instructions Sent | Notes | Doctor | LineID | VisitID |
-//   Is Membership | Supply Interval Days | Total Shipments | Shipments Sent | Next Ship Due | Last Shipment By
+//   Is Membership | Supply Interval Days | Total Shipments | Shipments Sent | Next Ship Due | Last Shipment By | Removed By
 // The last 6 columns are new — add them to your existing Orders tab header row
 // (don't reorder the earlier ones; existing rows already match those positions).
 const COLUMNS = [
@@ -16,6 +16,7 @@ const COLUMNS = [
   "Patient Price", "Type", "Payment Status", "Payment Date",
   "Collection Method", "Ordered", "Instructions Sent", "Notes", "Doctor", "LineID", "VisitID",
   "Is Membership", "Supply Interval Days", "Total Shipments", "Shipments Sent", "Next Ship Due", "Last Shipment By",
+  "Removed By",
 ];
 
 /** Turns Type/Payment/Ordered/Instructions into one glance-able status word —
@@ -47,6 +48,45 @@ function computeShipmentStatus(f, todayStr) {
 }
 
 
+/** "10% off" / "$25.00 off" — shown in Notes so whoever collects payment knows why the price is lower. */
+function discountNote(d) {
+  if (!d || !d.type || d.type === "none") return "";
+  const v = Number(d.value) || 0;
+  if (v <= 0) return "";
+  return d.type === "percent" ? `Discount applied: ${v}% off` : `Discount applied: $${v.toFixed(2)} off`;
+}
+
+/** Membership tier wording for Notes — says why a line costs $0 or less, so whoever collects payment isn't confused. */
+function tierNote(l) {
+  const t = Number(l && l.tier);
+  if (!t || t < 1 || t > 3) return "";
+  if (l.covered) return `Tier ${t} membership: covered`;
+  return `Tier ${t} membership: 10% off`;
+}
+
+/** Joins the non-empty note parts with " · " */
+function joinNotes(...parts) {
+  return parts.filter(Boolean).join(" · ");
+}
+
+/** "2026-11-05" (from a date picker) or "11/5/2026" -> "11/5/2026", or null if it isn't a real date within a year. */
+function parseShipDate(input) {
+  const s = String(input || "").trim();
+  let y, m, d;
+  let hit = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (hit) { y = +hit[1]; m = +hit[2]; d = +hit[3]; }
+  else {
+    hit = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!hit) return null;
+    m = +hit[1]; d = +hit[2]; y = +hit[3];
+  }
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null; // e.g. Feb 31
+  const diffDays = (dt.getTime() - Date.now()) / 86400000;
+  if (diffDays < -2 || diffDays > 366) return null; // not in the past, not more than a year out
+  return `${m}/${d}/${y}`;
+}
+
 /** Whole number >= 1; anything else keeps the old value (guards typos like 0 or -3). */
 function clampPositiveInt(value, fallback) {
   const n = Math.round(Number(value));
@@ -62,6 +102,7 @@ function rowFromFields(f) {
     f.doctor, f.lineId, f.visitId,
     f.isMembership || "N", f.supplyIntervalDays || "", f.totalShipments || "", f.shipmentsSent || 0, f.nextShipDue || "",
     f.lastShipmentBy || "",
+    f.removedBy || "",
   ];
 }
 
@@ -79,6 +120,7 @@ function fieldsFromRow(r) {
     shipmentsSent: Number(r["Shipments Sent"]) || 0,
     nextShipDue: r["Next Ship Due"] || "",
     lastShipmentBy: r["Last Shipment By"] || "",
+    removedBy: r["Removed By"] || "",
   };
 }
 
@@ -90,7 +132,7 @@ exports.handler = async (event) => {
     if (event.httpMethod === "GET") {
       const patientId = (event.queryStringParameters || {}).patientId;
       const rows = await readRange(process.env.APP_DATA_SHEET_ID, ORDERS_RANGE);
-      let orders = rowsToObjects(rows).filter((r) => r.LineID).map(fieldsFromRow);
+      let orders = rowsToObjects(rows).filter((r) => r.LineID).map(fieldsFromRow).filter((o) => !o.removedBy); // removed rows stay in the sheet, marked, but never show in the app
       if (patientId) orders = orders.filter((o) => o.patient === patientId);
       const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" });
       orders = orders.map((o) => ({ ...o, shipmentStatus: computeShipmentStatus(o, today) }));
@@ -100,16 +142,19 @@ exports.handler = async (event) => {
 
     if (event.httpMethod === "POST") {
       const body = JSON.parse(event.body || "{}");
-      const { patientId, type, blendName, lines } = body;
+      const { patientId, type, blendName, lines, quoteId } = body;
       if (!patientId || !type || !Array.isArray(lines) || !lines.length) {
         return json(400, { error: "patientId, type, and lines[] are required" });
       }
       const isPurchase = type === "purchase";
-      const visitId = crypto.randomUUID();
+      // When the saved quote's ID is passed in, reuse it as the VisitID so removing that
+      // quote later can also remove the orders made with it.
+      const visitId = typeof quoteId === "string" && quoteId.length > 0 && quoteId.length <= 100 ? quoteId : crypto.randomUUID();
       const date = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" });
 
       const rows = lines.map((l) => {
         const isMembership = l.isMembership ? "Y" : "N";
+        const coveredPurchase = isPurchase && l.covered === true;
         return rowFromFields({
           date, patient: patientId, doctor: doctor.name, visitId,
           peptide: `${l.name} \\ ${l.vendor?.format || ""} \\ ${l.vendor?.strengthMg ? l.vendor.strengthMg + "mg" : l.vendor?.rawStrength || ""}${blendName ? ` (blend: ${blendName})` : ""}`,
@@ -118,9 +163,14 @@ exports.handler = async (event) => {
           duration: l.config ? l.config.durationWeeks : "",
           units: l.unitsNeeded, patientPrice: l.patientCost,
           type: isPurchase ? "purchase" : "consultation",
-          paymentStatus: isPurchase ? "pending" : "",
+          // A line the membership fully covers has nothing to collect, so it starts as paid
+          // (method "Membership") instead of sitting in "Missing Payment".
+          paymentStatus: isPurchase ? (coveredPurchase ? "paid" : "pending") : "",
+          paymentDate: coveredPurchase ? date : "",
+          collectionMethod: coveredPurchase ? "Membership" : "",
           ordered: "N", instructionsSent: "N",
           lineId: crypto.randomUUID(),
+          notes: joinNotes(tierNote(l), discountNote(l.discount)),
           isMembership,
           supplyIntervalDays: isMembership === "Y" ? (l.supplyIntervalDays || 30) : "",
           totalShipments: isMembership === "Y" ? (l.totalShipments || 1) : "",
@@ -137,7 +187,26 @@ exports.handler = async (event) => {
 
     if (event.httpMethod === "PATCH") {
       const body = JSON.parse(event.body || "{}");
-      const { lineId, paymentStatus, paymentDate, collectionMethod, ordered, instructionsSent, notes, type, markShipmentSent, totalShipments, supplyIntervalDays } = body;
+      const { lineId, paymentStatus, paymentDate, collectionMethod, ordered, instructionsSent, notes, type, markShipmentSent, totalShipments, supplyIntervalDays, remove, visitId: removeVisitId, pushNextShipTo } = body;
+
+      // Remove every order made from one saved quote (used when a plan is removed from history).
+      if (remove && removeVisitId && !lineId) {
+        const marker = `${doctor.name} · ${new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" })}`;
+        const allRows = await readRange(process.env.APP_DATA_SHEET_ID, ORDERS_RANGE);
+        const objs = rowsToObjects(allRows);
+        let removed = 0;
+        for (let i = 0; i < objs.length; i++) {
+          if (objs[i].VisitID === removeVisitId && !objs[i]["Removed By"]) {
+            const f = { ...fieldsFromRow(objs[i]), removedBy: marker };
+            const rowNo = i + 2;
+            const lastC = String.fromCharCode(65 + COLUMNS.length - 1);
+            await updateRange(process.env.APP_DATA_SHEET_ID, `${ORDERS_RANGE}!A${rowNo}:${lastC}${rowNo}`, rowFromFields(f));
+            removed++;
+          }
+        }
+        return json(200, { visitId: removeVisitId, removed });
+      }
+
       if (!lineId) return json(400, { error: "lineId is required" });
 
       const rawRows = await readRange(process.env.APP_DATA_SHEET_ID, ORDERS_RANGE);
@@ -196,12 +265,26 @@ exports.handler = async (event) => {
         updated.lastShipmentBy = `${doctor.name} · ${todayStr}`; // name from verified sign-in, never client-supplied
       }
 
+      // Push the next shipment to a new date (patient traveling, supply running long, etc.).
+      // The old and new dates are written into Notes so there is a trail of who moved it.
+      if (pushNextShipTo !== undefined) {
+        if (existing.isMembership !== "Y") return json(400, { error: "This order has no shipment schedule to change." });
+        if (alreadyComplete || !existing.nextShipDue) return json(400, { error: "All shipments for this order are already sent." });
+        const newDate = parseShipDate(pushNextShipTo);
+        if (!newDate) return json(400, { error: "Pick a real date within the next year." });
+        updated.nextShipDue = newDate;
+        updated.notes = joinNotes(existing.notes, `Next shipment moved ${existing.nextShipDue} → ${newDate} by ${doctor.name} (${todayStr})`);
+      }
+
+      if (remove) updated.removedBy = `${doctor.name} · ${todayStr}`;
+
       const sheetRowNumber = rowIndex + 2; // +1 for header row, +1 for 1-based indexing
       const lastCol = String.fromCharCode(65 + COLUMNS.length - 1);
       await updateRange(process.env.APP_DATA_SHEET_ID, `${ORDERS_RANGE}!A${sheetRowNumber}:${lastCol}${sheetRowNumber}`, rowFromFields(updated));
 
       return json(200, {
         lineId,
+        removed: !!remove,
         status: computeStatus(updated),
         shipmentsSent: updated.shipmentsSent,
         nextShipDue: updated.nextShipDue,
@@ -209,6 +292,7 @@ exports.handler = async (event) => {
         totalShipments: updated.totalShipments,
         supplyIntervalDays: updated.supplyIntervalDays,
         lastShipmentBy: updated.lastShipmentBy,
+        notes: updated.notes,
       });
     }
 

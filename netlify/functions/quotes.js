@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const { readRange, appendRow } = require("./_lib/sheets");
+const { readRange, appendRow, updateRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
 const { rowsToObjects, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
@@ -39,11 +39,11 @@ exports.handler = async (event) => {
       ]);
 
       const consultations = rowsToObjects(quoteRows)
-        .filter((r) => r.PatientID === patientId && r.QuoteID)
+        .filter((r) => r.PatientID === patientId && r.QuoteID && !r["Removed By"])
         .map((r) => toRecord(r, "consulted"));
 
       const purchases = rowsToObjects(patientRows)
-        .filter((r) => r.PatientID === patientId && r.QuoteID) // skip the plain "patient created" rows — no QuoteID on those
+        .filter((r) => r.PatientID === patientId && r.QuoteID && !r["Removed By"]) // skip the plain "patient created" rows — no QuoteID on those
         .map((r) => toRecord(r, "purchased"));
 
       const records = [...consultations, ...purchases].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
@@ -91,6 +91,28 @@ exports.handler = async (event) => {
       }
 
       return json(201, { ...record, lines, schedule, totalOffice, totalPatient });
+    }
+
+    if (event.httpMethod === "PATCH") {
+      // Remove a saved quote/plan from a patient's history. The row is kept in the
+      // sheet and marked "Removed By" — nothing is erased, it just stops showing in the app.
+      const { quoteId, remove } = JSON.parse(event.body || "{}");
+      if (!quoteId || !remove) return json(400, { error: "quoteId and remove:true are required" });
+      const marker = `${doctor.name} · ${new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" })}`;
+      for (const tab of [QUOTES_RANGE, PATIENTS_RANGE]) {
+        const rows = await readRange(process.env.APP_DATA_SHEET_ID, tab);
+        if (!rows.length) continue;
+        const headers = rows[0].map((h) => (h || "").toString().trim());
+        const qIdx = headers.indexOf("QuoteID");
+        if (qIdx === -1) continue;
+        const rowIdx = rows.findIndex((r, i) => i > 0 && r[qIdx] === quoteId);
+        if (rowIdx === -1) continue;
+        const rIdx = headers.indexOf("Removed By");
+        if (rIdx === -1) return json(500, { error: `The ${tab} tab needs a "Removed By" column header in its first row.` });
+        await updateRange(process.env.APP_DATA_SHEET_ID, `${tab}!${colLetter(rIdx)}${rowIdx + 1}`, [marker]);
+        return json(200, { quoteId, removed: true });
+      }
+      return json(404, { error: "No saved record found with that ID" });
     }
 
     return json(405, { error: "Method not allowed" });
@@ -149,4 +171,11 @@ function safeParse(str, fallback) {
   } catch {
     return fallback;
   }
+}
+
+/** 0 -> A, 25 -> Z, 26 -> AA */
+function colLetter(i) {
+  let n = i + 1, s = "";
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
 }

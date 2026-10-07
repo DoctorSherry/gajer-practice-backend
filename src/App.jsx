@@ -105,6 +105,101 @@ function isFinishedMembership(o) {
   return o.isMembership === "Y" && o.shipmentStatus === "Membership Complete" && o.status === "Completed";
 }
 
+// Discounts: a percent or a flat dollar amount (e.g. a gift card), never below $0.
+function applyDiscount(amount, d) {
+  const base = Number(amount) || 0;
+  if (!d || d.type === "none" || base <= 0) return { final: base, off: 0 };
+  const v = Math.max(0, Number(d.value) || 0);
+  let off = d.type === "percent" ? (base * Math.min(v, 100)) / 100 : Math.min(v, base);
+  off = Math.round(off * 100) / 100;
+  if (off <= 0) return { final: base, off: 0 };
+  return { final: Math.round((base - off) * 100) / 100, off };
+}
+function discountLabel(d) {
+  if (!d || d.type === "none") return "";
+  const v = Number(d.value) || 0;
+  return d.type === "percent" ? `${v}% off` : `$${v.toFixed(2)} off`;
+}
+// Re-prices a set of lines so they add up to exactly `target`, keeping each
+// line's share of the total. The last line absorbs rounding so cents never go missing.
+function scaleLinesTo(lines, target) {
+  const total = lines.reduce((sum, l) => sum + (Number(l.patientCost) || 0), 0);
+  if (!lines.length || total <= 0 || Math.abs(total - target) < 0.005) return lines.map((l) => ({ ...l }));
+  // The line that absorbs rounding must be one that really costs something, so a
+  // $0 membership-covered line can never pick up stray cents.
+  let lastPaid = -1;
+  lines.forEach((l, i) => { if ((Number(l.patientCost) || 0) > 0) lastPaid = i; });
+  let running = 0;
+  return lines.map((l, i) => {
+    const cost = Number(l.patientCost) || 0;
+    if (cost <= 0) return { ...l, patientCost: 0 };
+    const share = i === lastPaid
+      ? Math.max(0, Math.round((target - running) * 100) / 100)
+      : Math.round((cost / total) * target * 100) / 100;
+    running += share;
+    return { ...l, patientCost: share };
+  });
+}
+
+// <TIER-LOGIC>
+// Membership tiers (Patrick, Oct 2026): Tier 1 = 10% off everything. Tier 2 = the most
+// expensive item is covered, the rest 10% off. Tier 3 = the three most expensive items are
+// covered, the rest 10% off. Covered items ship one month at a time; everything else is
+// bought as a full course.
+const TIER_LABELS = ["No membership", "Tier 1", "Tier 2", "Tier 3"];
+const TIER_COVERED_COUNT = [0, 0, 1, 3];
+const TIER_PERCENT_OFF = 10;
+function clampTier(t) {
+  const n = Math.round(Number(t));
+  return n >= 0 && n <= 3 ? n : 0;
+}
+// prices: patient price of each item, in order. Returns one result per item, same order.
+function tierPricing(prices, tier) {
+  const t = clampTier(tier);
+  const out = prices.map((p) => {
+    const price = Math.max(0, Number(p) || 0);
+    return { price, final: price, off: 0, covered: false };
+  });
+  if (t === 0) return out;
+  const order = out.map((_, i) => i).sort((a, b) => (out[b].price - out[a].price) || (a - b));
+  let freeLeft = TIER_COVERED_COUNT[t];
+  order.forEach((i) => {
+    const r = out[i];
+    if (r.price <= 0) return;
+    if (freeLeft > 0) { freeLeft--; r.covered = true; r.final = 0; r.off = r.price; return; }
+    r.off = Math.round(r.price * TIER_PERCENT_OFF) / 100;
+    r.final = Math.round((r.price - r.off) * 100) / 100;
+  });
+  return out;
+}
+function tierLine(tier, r) {
+  return r.covered ? `${TIER_LABELS[tier]} membership — covered` : `${TIER_LABELS[tier]} membership — ${TIER_PERCENT_OFF}% off`;
+}
+// What gets saved on a line so Orders and History know why it costs what it does.
+function tierMetaOf(tier, covered, priceBeforeTier) {
+  return clampTier(tier) > 0 ? { tier: clampTier(tier), covered: !!covered, priceBeforeTier } : {};
+}
+function courseWeeksOf(line) {
+  if (line && Array.isArray(line.phases) && line.phases.length) return line.phases.reduce((n, p) => n + (Number(p.durationWeeks) || 0), 0);
+  return Number(line && line.config && line.config.durationWeeks) || 0;
+}
+function coveredShipmentCount(line, intervalDays = 30) {
+  return Math.max(1, Math.ceil((courseWeeksOf(line) * 7) / intervalDays));
+}
+// Decides, at save time, which lines ship in installments. Covered lines (Tier 2/3) ship a
+// month at a time automatically. For patients without a covering tier, the manual
+// Membership box applies if it was ticked. Nothing ships on a consultation-only save.
+function applyShipping(lines, { purchased, manual }) {
+  return lines.map((l) => {
+    const base = { ...l, isMembership: false };
+    if (!purchased) return base;
+    if (l.covered) return { ...base, isMembership: true, supplyIntervalDays: 30, totalShipments: coveredShipmentCount(l, 30) };
+    if (manual) return { ...base, isMembership: true, supplyIntervalDays: manual.interval, totalShipments: manual.total };
+    return base;
+  });
+}
+// </TIER-LOGIC>
+
 const STRIPS_PER_BOX = 30; // the sheet's price/strength for "Strip" items describes a whole box, not one strip
 
 function buildDatabase(vendors, protocols) {
@@ -290,6 +385,51 @@ function StatusToggle({ value, onChange }) {
   );
 }
 
+// Percent-off or dollar-off (gift card) box. Works in Consultation View too —
+// it only ever shows patient-facing prices.
+function DiscountControl({ discount, onChange, baseAmount, className = "" }) {
+  const { final, off } = applyDiscount(baseAmount, discount);
+  const active = discount.type !== "none";
+  return (
+    <div className={`p-2.5 rounded-lg ${className}`} style={{ background: active ? C.amberSoft : "transparent", border: `1px solid ${active ? C.amber : C.line}` }}>
+      <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: C.inkSoft }}>
+        <span className="font-medium" style={{ color: C.ink }}>Discount or gift card</span>
+        <select
+          value={discount.type}
+          onChange={(e) => onChange({ type: e.target.value, value: e.target.value === "none" ? 0 : discount.value })}
+          className="px-2 py-1 rounded-md text-xs outline-none"
+          style={{ border: `1px solid ${C.line}`, background: C.card, color: C.ink }}
+        >
+          <option value="none">None</option>
+          <option value="percent">Percent off</option>
+          <option value="amount">Dollar amount off</option>
+        </select>
+        {active && (
+          <>
+            {discount.type === "amount" && <span>$</span>}
+            <input
+              type="number" min="0" step={discount.type === "percent" ? "1" : "0.01"}
+              value={discount.value}
+              onChange={(e) => onChange({ ...discount, value: Math.max(0, parseFloat(e.target.value) || 0) })}
+              className="w-24 px-2 py-1 rounded-md text-sm outline-none"
+              style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, background: C.card }}
+            />
+            {discount.type === "percent" && <span>%</span>}
+          </>
+        )}
+      </div>
+      {active && off > 0 && (
+        <div className="text-xs mt-1.5" style={{ color: C.ink, fontFamily: FONT_MONO }}>
+          {money(baseAmount)} − {money(off)} = <strong style={{ color: C.amber }}>{money(final)}</strong> patient pays
+        </div>
+      )}
+      {active && discount.type === "amount" && discount.value > baseAmount && baseAmount > 0 && (
+        <div className="text-xs mt-1" style={{ color: C.clay }}>That is more than the price, so it is capped at {money(baseAmount)}.</div>
+      )}
+    </div>
+  );
+}
+
 // Shown next to StatusToggle whenever a Purchase is being saved — lets a
 // doctor flag a tiered/membership patient as getting a recurring monthly
 // supply instead of the whole course at once, with the Orders tab then
@@ -320,6 +460,46 @@ function MembershipToggle({ isMembership, onToggle, intervalDays, onIntervalChan
           <span>total shipments</span>
         </div>
       )}
+    </div>
+  );
+}
+
+// Membership tier picker — sits in the patient banner. Prices recalculate as soon as it changes.
+function TierSelector({ tier, onChange, disabled, status, onRetry }) {
+  if (status === "error") {
+    return (
+      <span className="flex items-center gap-2 text-xs" style={{ color: C.clay }}>
+        Couldn't load this patient's membership tier — prices could be wrong.
+        <button onClick={onRetry} className="underline font-medium">Retry</button>
+      </span>
+    );
+  }
+  if (status !== "ok") return <span className="text-xs" style={{ color: C.inkSoft }}>Loading membership…</span>;
+  return (
+    <div className="flex items-center gap-2 text-xs" style={{ color: C.inkSoft }}>
+      <span>Membership:</span>
+      <div className="flex rounded-md overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
+        {[0, 1, 2, 3].map((t) => (
+          <button
+            key={t}
+            disabled={disabled}
+            onClick={() => { if (t !== tier) onChange(t); }}
+            className="px-2.5 py-1 text-xs font-medium disabled:opacity-50"
+            style={{ background: tier === t ? (t === 0 ? C.inkSoft : C.teal) : "transparent", color: tier === t ? "white" : C.inkSoft }}
+          >
+            {t === 0 ? "None" : `Tier ${t}`}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Replaces the manual Membership box for Tier 2/3 patients — shipments are automatic for covered items.
+function TierShipNote({ tier }) {
+  return (
+    <div className="mb-2 p-2 rounded-md text-xs" style={{ background: C.tealSoft, border: `1px solid ${C.teal}`, color: C.tealDark }}>
+      <strong>{TIER_LABELS[tier]} membership:</strong> covered peptides ship one month at a time and show up in Orders with their due dates. Anything not covered is bought as the full course.
     </div>
   );
 }
@@ -387,6 +567,11 @@ export default function GajerPeptideApp() {
   const [ordersSortMode, setOrdersSortMode] = useState("status"); // "status" | "shipmentDue"
   const [showFinishedMemberships, setShowFinishedMemberships] = useState(false);
   const [patientMode, setPatientMode] = useState(false);
+  const [patientTier, setPatientTier] = useState(0); // 0 = no membership, 1-3 = tier
+  const [tierStatus, setTierStatus] = useState("idle"); // idle | loading | ok | error — saves wait until "ok" so a member is never priced as a non-member
+  const [tierSaving, setTierSaving] = useState(false);
+  const [tierReload, setTierReload] = useState(0);
+  const [pushDates, setPushDates] = useState({}); // lineId -> date chosen for "push next shipment"
 
   const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState(null);
@@ -401,6 +586,11 @@ export default function GajerPeptideApp() {
   const [useFlat, setUseFlat] = useState(false);
 
   const [planCart, setPlanCart] = useState([]);
+  const [singleDiscount, setSingleDiscount] = useState({ type: "none", value: 0 });
+  const [planDiscount, setPlanDiscount] = useState({ type: "none", value: 0 });
+  const [blendDiscount, setBlendDiscount] = useState({ type: "none", value: 0 });
+  const [confirmRemoveId, setConfirmRemoveId] = useState(null); // "order:<lineId>" or "record:<quoteId>" while waiting for the second click
+  const [removingId, setRemovingId] = useState(null);
 
   // Custom Blend builder — a doctor-compounded formulation, not a vendor-catalog item
   const [blendName, setBlendName] = useState("");
@@ -627,6 +817,42 @@ export default function GajerPeptideApp() {
     })();
   }, [activePatientId, idToken]);
 
+  /* ---------- backend: load the active patient's membership tier ---------- */
+  useEffect(() => {
+    if (!activePatientId || !idToken) { setPatientTier(0); setTierStatus("idle"); return; }
+    let cancelled = false;
+    setTierStatus("loading");
+    (async () => {
+      try {
+        const data = await authFetch(`/tiers?patientId=${encodeURIComponent(activePatientId)}`);
+        if (cancelled) return;
+        setPatientTier(clampTier(data.tier));
+        setTierStatus("ok");
+      } catch {
+        if (cancelled) return;
+        setPatientTier(0);
+        setTierStatus("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activePatientId, idToken, tierReload]);
+
+  async function changeTier(next) {
+    if (!activePatientId || tierSaving) return;
+    const previous = patientTier;
+    setPatientTier(next);
+    setTierSaving(true);
+    try {
+      await authFetch("/tiers", { method: "POST", body: JSON.stringify({ patientId: activePatientId, tier: next }) });
+      showToast(`${activePatientId} is now ${next === 0 ? "not on a membership" : TIER_LABELS[next]}`);
+    } catch (err) {
+      setPatientTier(previous);
+      showToast(`Couldn't change the tier: ${err.message}`);
+    } finally {
+      setTierSaving(false);
+    }
+  }
+
   /* ---------- backend: load the shared Orders list ---------- */
   async function loadOrders() {
     if (!idToken) return;
@@ -691,6 +917,63 @@ export default function GajerPeptideApp() {
     }
   }
 
+  async function pushShipment(lineId) {
+    const date = pushDates[lineId];
+    if (!date) return;
+    setOrdersSavingId(lineId);
+    try {
+      const result = await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, pushNextShipTo: date }) });
+      setAllOrders((prev) => prev.map((o) => (o.lineId === lineId
+        ? { ...o, nextShipDue: result.nextShipDue, shipmentStatus: result.shipmentStatus, notes: result.notes ?? o.notes }
+        : o)));
+      setPushDates((prev) => ({ ...prev, [lineId]: "" }));
+      showToast(`Next shipment moved to ${result.nextShipDue}`);
+    } catch (err) {
+      showToast(`Couldn't move the shipment: ${err.message}`);
+    } finally {
+      setOrdersSavingId(null);
+    }
+  }
+
+  async function removeOrder(lineId) {
+    setRemovingId(lineId);
+    try {
+      await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ lineId, remove: true }) });
+      setAllOrders((prev) => prev.filter((o) => o.lineId !== lineId));
+      setOrdersExpandedId(null);
+      setConfirmRemoveId(null);
+      showToast("Order removed");
+    } catch (err) {
+      showToast(`Couldn't remove: ${err.message}`);
+    } finally {
+      setRemovingId(null);
+    }
+  }
+
+  // Removes a saved quote/plan from the patient's history, along with any
+  // orders that were created from it. The sheet rows are kept and marked, never erased.
+  async function removeRecord(record) {
+    setRemovingId(record.id);
+    try {
+      await authFetch("/quotes", { method: "PATCH", body: JSON.stringify({ quoteId: record.id, remove: true }) });
+      setPatientHistory((prev) => ({ ...prev, [record.patientId]: (prev[record.patientId] || []).filter((r) => r.id !== record.id) }));
+      setConfirmRemoveId(null);
+      if (allOrders.some((o) => o.visitId === record.id)) {
+        try {
+          await authFetch("/orders", { method: "PATCH", body: JSON.stringify({ visitId: record.id, remove: true }) });
+        } catch (e) {
+          showToast("Removed from history, but its orders could not be removed — remove them in Orders.");
+        }
+        loadOrders();
+      }
+      showToast("Removed from this patient's history");
+    } catch (err) {
+      showToast(`Couldn't remove: ${err.message}`);
+    } finally {
+      setRemovingId(null);
+    }
+  }
+
   // Patient Mode always defaults OFF on a new patient — never carries over.
   useEffect(() => {
     setPatientMode(false);
@@ -710,6 +993,7 @@ export default function GajerPeptideApp() {
     async (record) => {
       if (!activePatientId) return false;
       if (!idToken) { setPatientIdError("Please sign in with Google first."); return false; }
+      if (tierStatus !== "ok" || tierSaving) { setPatientIdError("This patient's membership tier hasn't loaded yet — wait a moment, or use Retry, before saving."); return false; }
       if (savingRef.current) return false; // a save is already running — ignore the extra click
       savingRef.current = true;
       setIsSaving(true);
@@ -733,6 +1017,7 @@ export default function GajerPeptideApp() {
               patientId: activePatientId,
               type: record.status === "consulted" ? "consultation" : "purchase",
               blendName: record.blendName,
+              quoteId: saved.id,
               lines: record.lines,
             }),
           });
@@ -748,7 +1033,7 @@ export default function GajerPeptideApp() {
       }
       return ok;
     },
-    [activePatientId, idToken]
+    [activePatientId, idToken, tierStatus, tierSaving]
   );
 
   /* ---------- derived selection ---------- */
@@ -783,11 +1068,16 @@ export default function GajerPeptideApp() {
 
   const selectedVendor = vendorRows.find((v) => v.id === selectedVendorId) || vendorRows[0] || null;
   const officeCost = selectedVendor ? selectedVendor.computed.costOffice : 0;
-  const patientCost = useFlat && flatOverride != null ? flatOverride : officeCost * multiplier;
+  const priceBeforeDiscount = useFlat && flatOverride != null ? flatOverride : officeCost * multiplier;
+  const singleTier = tierPricing([priceBeforeDiscount], patientTier)[0]; // membership first…
+  const priceAfterTier = singleTier.final;
+  const singleDiscountResult = applyDiscount(priceAfterTier, singleDiscount); // …then any manual discount or gift card
+  const patientCost = singleDiscountResult.final; // what the patient actually pays
 
   function selectPeptide(key) {
     const p = peptideDatabase.find((x) => x.key === key);
     setSelectedKey(key);
+    setSingleDiscount({ type: "none", value: 0 });
     if (p && p.protocol) setConfig({ ...p.protocol });
     else setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
     setDurationUnit("weeks");
@@ -810,6 +1100,7 @@ export default function GajerPeptideApp() {
 
   function clearProtocol() {
     setSelectedKey(null);
+    setSingleDiscount({ type: "none", value: 0 });
     setSelectedVendorId(null);
     setConfig({ doseMg: 0, freqPerWeek: 0, durationWeeks: 0 });
     setDurationUnit("weeks");
@@ -841,6 +1132,7 @@ export default function GajerPeptideApp() {
     setPatientIdError("");
     clearProtocol();
     setPlanCart([]);
+    setPlanDiscount({ type: "none", value: 0 });
     resetBlendBuilder();
     setExportRecord(null);
     setRecordStatus("purchased");
@@ -850,7 +1142,7 @@ export default function GajerPeptideApp() {
     setActiveTab("search");
   }
 
-  function currentLineSnapshot() {
+  function currentLineSnapshot(withDiscount = true) {
     return {
       key: selectedPeptide.key,
       name: selectedPeptide.displayName,
@@ -863,16 +1155,25 @@ export default function GajerPeptideApp() {
       officeCost,
       multiplier,
       flatOverride: useFlat ? flatOverride : null,
-      patientCost,
-      isMembership: recordStatus === "purchased" && isMembershipSupply,
-      supplyIntervalDays,
-      totalShipments,
+      patientCost: withDiscount ? patientCost : priceBeforeDiscount,
+      discount: withDiscount && singleDiscountResult.off > 0
+        ? { type: singleDiscount.type, value: singleDiscount.value, amountOff: singleDiscountResult.off, priceBefore: priceBeforeDiscount }
+        : undefined,
+      ...(withDiscount ? tierMetaOf(patientTier, singleTier.covered, priceBeforeDiscount) : {}),
+    };
+  }
+
+  // Shared by all three save buttons: which lines ship in installments.
+  function shippingOptions() {
+    return {
+      purchased: recordStatus === "purchased",
+      manual: patientTier < 2 && isMembershipSupply ? { interval: supplyIntervalDays, total: totalShipments } : null,
     };
   }
 
   function addToPlan() {
     if (!selectedPeptide || !selectedVendor) return;
-    setPlanCart((prev) => [...prev, { ...currentLineSnapshot(), lineId: uid(), type: "single" }]);
+    setPlanCart((prev) => [...prev, { ...currentLineSnapshot(false), lineId: uid(), type: "single" }]);
   }
 
   function removePlanLine(lineId) {
@@ -892,13 +1193,16 @@ export default function GajerPeptideApp() {
     );
   }
 
-  function flattenPlanCartForSave(cart) {
+  function flattenPlanCartForSave(cart, tierResults) {
     const flat = [];
-    cart.forEach((l) => {
+    cart.forEach((l, i) => {
+      const r = tierResults[i];
       if (l.type === "blend") {
-        l.components.forEach((comp) => flat.push({ ...comp, groupLabel: l.name }));
+        const before = scaleLinesTo(l.components, l.patientCost); // each component's share before membership
+        scaleLinesTo(l.components, r.final).forEach((comp, ci) =>
+          flat.push({ ...comp, ...tierMetaOf(patientTier, r.covered, before[ci].patientCost), groupLabel: l.name })); // components always add up to the blend's price
       } else {
-        flat.push({ ...l });
+        flat.push({ ...l, patientCost: r.final, ...tierMetaOf(patientTier, r.covered, l.patientCost) });
       }
     });
     return flat;
@@ -920,8 +1224,11 @@ export default function GajerPeptideApp() {
       unitsNeeded: l.unitsNeeded,
       officeCost: l.officeCost,
       multiplier: l.multiplier ?? 3,
-      flatOverride: l.flatOverride ?? null,
-      patientCost: l.patientCost,
+      // A line saved with a membership tier carries its pre-membership price — start from that so the tier isn't applied twice.
+      flatOverride: l.priceBeforeTier != null
+        ? (Math.abs(l.priceBeforeTier - (l.officeCost || 0) * (l.multiplier ?? 3)) > 0.005 ? l.priceBeforeTier : null)
+        : (l.discount ? l.patientCost : (l.flatOverride ?? null)), // keep an already-discounted price as it was saved
+      patientCost: l.priceBeforeTier != null ? l.priceBeforeTier : l.patientCost,
     }));
     setPlanCart(lines);
     setRecordStatus("purchased");
@@ -939,16 +1246,25 @@ export default function GajerPeptideApp() {
     { office: 0, patient: 0 }
   );
 
+  const planTier = tierPricing(planCart.map((l) => l.patientCost), patientTier); // one result per cart item (a blend counts as one item)
+  const planTierTotal = Math.round(planTier.reduce((n, r) => n + r.final, 0) * 100) / 100;
+  const planDiscountResult = applyDiscount(planTierTotal, planDiscount);
+
   async function saveSingleQuote() {
     if (!selectedPeptide || !selectedVendor || !activePatientId) return;
-    await saveRecord({ type: "single", status: recordStatus, lines: [currentLineSnapshot()], totalOffice: officeCost, totalPatient: patientCost });
+    await saveRecord({ type: "single", status: recordStatus, lines: applyShipping([currentLineSnapshot()], shippingOptions()), totalOffice: officeCost, totalPatient: patientCost });
   }
 
   async function savePlanQuote() {
     if (!planCart.length || !activePatientId) return;
-    const lines = flattenPlanCartForSave(planCart);
-    const ok = await saveRecord({ type: "plan", status: recordStatus, lines, totalOffice: planTotals.office, totalPatient: planTotals.patient });
-    if (ok) setPlanCart([]); // only clear once it actually saved, so a failed save loses nothing
+    let lines = flattenPlanCartForSave(planCart, planTier);
+    if (planDiscountResult.off > 0) {
+      // spread the discount across the lines so each order row shows what was really charged
+      lines = scaleLinesTo(lines, planDiscountResult.final).map((l) => (l.patientCost > 0 ? { ...l, discount: { type: planDiscount.type, value: planDiscount.value, scope: "plan" } } : l));
+    }
+    lines = applyShipping(lines, shippingOptions());
+    const ok = await saveRecord({ type: "plan", status: recordStatus, lines, totalOffice: planTotals.office, totalPatient: planDiscountResult.final });
+    if (ok) { setPlanCart([]); setPlanDiscount({ type: "none", value: 0 }); } // only clear once it actually saved, so a failed save loses nothing
   }
 
   /* ---------- Custom Blend builder logic ---------- */
@@ -969,6 +1285,7 @@ export default function GajerPeptideApp() {
   function resetBlendBuilder() {
     setBlendName(""); setBlendFreqPerWeek(7); setBlendDurationWeeks(4); setBlendDurationUnit("weeks"); setBlendDoseVolumeMl(0);
     setBlendComponents([]); setBlendMultiplier(3); setBlendFlatOverride(null); setBlendUseFlat(false);
+    setBlendDiscount({ type: "none", value: 0 });
   }
 
   const blendComputed = useMemo(() => {
@@ -984,11 +1301,15 @@ export default function GajerPeptideApp() {
 
   const blendOfficeTotal = blendComputed.reduce((s, c) => s + c.computed.costOffice, 0);
   const blendPatientTotal = blendUseFlat && blendFlatOverride != null ? blendFlatOverride : blendOfficeTotal * blendMultiplier;
+  const blendTier = tierPricing([blendPatientTotal], patientTier)[0];
+  const blendAfterTier = blendTier.final;
+  const blendDiscountResult = applyDiscount(blendAfterTier, blendDiscount);
+  const blendFinal = blendDiscountResult.final;
   const blendDoseUnits = blendDoseVolumeMl > 0 ? Math.round(blendDoseVolumeMl * 100) : null;
   const blendDisplayName = blendName.trim() || blendComponents.map((c) => c.name).join(" + ") || "Untitled blend";
 
-  function blendSnapshotLines() {
-    return blendComputed.map((c) => ({
+  function blendSnapshotLines(target = blendPatientTotal) {
+    const raw = blendComputed.map((c) => ({
       key: c.key,
       name: c.name,
       config: { doseMg: c.doseMg, freqPerWeek: blendFreqPerWeek, durationWeeks: blendDurationWeeks },
@@ -999,10 +1320,8 @@ export default function GajerPeptideApp() {
       multiplier: blendMultiplier,
       flatOverride: null,
       patientCost: c.computed.costOffice * blendMultiplier,
-      isMembership: recordStatus === "purchased" && isMembershipSupply,
-      supplyIntervalDays,
-      totalShipments,
     }));
+    return scaleLinesTo(raw, target); // line prices always add up to the blend's price
   }
 
   async function saveCustomBlendQuote() {
@@ -1012,9 +1331,14 @@ export default function GajerPeptideApp() {
       status: recordStatus,
       blendName: blendDisplayName,
       schedule: { freqPerWeek: blendFreqPerWeek, durationWeeks: blendDurationWeeks, doseVolumeMl: blendDoseVolumeMl },
-      lines: blendSnapshotLines(),
+      lines: (() => {
+        const before = blendSnapshotLines(blendPatientTotal); // each component's share before membership
+        let ls = blendSnapshotLines(blendFinal).map((l, i) => ({ ...l, ...tierMetaOf(patientTier, blendTier.covered, before[i].patientCost) }));
+        if (blendDiscountResult.off > 0) ls = ls.map((l) => (l.patientCost > 0 ? { ...l, discount: { type: blendDiscount.type, value: blendDiscount.value, scope: "blend" } } : l));
+        return applyShipping(ls, shippingOptions());
+      })(),
       totalOffice: blendOfficeTotal,
-      totalPatient: blendPatientTotal,
+      totalPatient: blendFinal,
     });
     if (ok) resetBlendBuilder();
   }
@@ -1327,6 +1651,7 @@ export default function GajerPeptideApp() {
                 <Tag tone="green" icon={<CheckCircle2 size={12} />}>
                   Active: {activePatientId} · {historyList.length} record{historyList.length === 1 ? "" : "s"}
                 </Tag>
+                <TierSelector tier={patientTier} status={tierStatus} disabled={tierSaving} onChange={changeTier} onRetry={() => setTierReload((n) => n + 1)} />
                 {historyList.length > 0 && (
                   <button
                     onClick={() => setActiveTab("history")}
@@ -1729,12 +2054,22 @@ export default function GajerPeptideApp() {
                                 ? phases.map((p, i) => `${p.doseMg}mg × ${p.freqPerWeek}/wk (${p.durationWeeks}wk)`).join(" then ")
                                 : `${config.doseMg}${doseUnit} · ${config.freqPerWeek}×/week · ${config.durationWeeks} weeks`}
                             </div>
+                            {patientTier > 0 && singleTier.off > 0 && (
+                              <div className="text-xs mt-1" style={{ color: C.amber }}>
+                                {tierLine(patientTier, singleTier)} · was {money(priceBeforeDiscount)}
+                              </div>
+                            )}
+                            {singleDiscountResult.off > 0 && (
+                              <div className="text-xs mt-1" style={{ color: C.amber }}>
+                                {discountLabel(singleDiscount)} · was {money(priceAfterTier)}
+                              </div>
+                            )}
                           </div>
                           <div className="flex items-center gap-2 mb-4">
                             <span className="text-sm" style={{ color: C.inkSoft }}>Adjust this price</span>
                             <input
                               type="number" step="1"
-                              value={useFlat && flatOverride != null ? flatOverride : Math.round(patientCost)}
+                              value={useFlat && flatOverride != null ? flatOverride : Math.round(priceBeforeDiscount)}
                               onChange={(e) => { setUseFlat(true); setFlatOverride(parseFloat(e.target.value) || 0); }}
                               className="w-28 px-2 py-1.5 rounded-md text-sm outline-none"
                               style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }}
@@ -1778,24 +2113,28 @@ export default function GajerPeptideApp() {
                           <div className="rounded-lg p-3 mb-4" style={{ background: C.paper, fontFamily: FONT_MONO, fontSize: 13 }}>
                             <LedgerRow label={`${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
-                            <LedgerRow label={useFlat ? "Flat patient price" : `Patient price (${multiplier}×)`} value={money(patientCost)} strong />
+                            <LedgerRow label={useFlat ? "Flat patient price" : `Patient price (${multiplier}×)`} value={money(priceBeforeDiscount)} strong={singleDiscountResult.off <= 0 && singleTier.off <= 0} />
+                            {patientTier > 0 && singleTier.off > 0 && <LedgerRow label={tierLine(patientTier, singleTier)} value={`−${money(singleTier.off)}`} />}
+                            {singleDiscountResult.off > 0 && <LedgerRow label={`Discount (${discountLabel(singleDiscount)})`} value={`−${money(singleDiscountResult.off)}`} />}
+                            {(singleDiscountResult.off > 0 || singleTier.off > 0) && <LedgerRow label="Patient pays" value={money(patientCost)} strong />}
                             <LedgerRow label="Per-mg patient rate" value={totalMg > 0 ? `${money(patientCost / totalMg)}/mg` : "—"} sub />
                           </div>
                         </>
                       )}
 
-                      {!patientMode && (
-                        <>
-                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
-                          {recordStatus === "purchased" && (
+                      <DiscountControl className="mb-3" discount={singleDiscount} onChange={setSingleDiscount} baseAmount={priceAfterTier} />
+
+                      {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                          {recordStatus === "purchased" && (patientTier >= 2 ? (
+                            <TierShipNote tier={patientTier} />
+                          ) : (
                             <MembershipToggle
                               isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
                               intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
                               totalShipments={totalShipments} onTotalChange={setTotalShipments}
                             />
-                          )}
-                        </>
-                      )}
+                          ))}
+
                       <div className="flex gap-2">
                         <button onClick={addToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: C.successSoft, color: C.success }}>
                           <Plus size={14} /> Add to treatment plan
@@ -1849,7 +2188,7 @@ export default function GajerPeptideApp() {
                 </div>
               )}
               <div className="flex flex-col gap-2">
-                {planCart.map((l) => (
+                {planCart.map((l, idx) => (
                   <div key={l.lineId} className="p-3 rounded-lg flex items-center justify-between gap-3" style={{ border: `1px solid ${C.line}` }}>
                     <div className="flex-1">
                       <div className="text-sm font-medium flex items-center gap-1.5">
@@ -1878,7 +2217,9 @@ export default function GajerPeptideApp() {
                       </div>
                     )}
                     <div className="text-right w-28">
-                      <div className="text-sm font-semibold" style={{ fontFamily: FONT_MONO, color: patientMode ? C.amber : C.ink }}>{money(l.patientCost)}</div>
+                      <div className="text-sm font-semibold" style={{ fontFamily: FONT_MONO, color: patientMode ? C.amber : C.ink }}>{money(planTier[idx] ? planTier[idx].final : l.patientCost)}</div>
+                      {patientTier > 0 && planTier[idx] && planTier[idx].covered && <div className="text-xs font-medium" style={{ color: C.success }}>covered · was {money(l.patientCost)}</div>}
+                      {patientTier > 0 && planTier[idx] && !planTier[idx].covered && planTier[idx].off > 0 && <div className="text-xs" style={{ color: C.amber }}>{TIER_PERCENT_OFF}% off · was {money(l.patientCost)}</div>}
                       {!patientMode && <div className="text-xs" style={{ color: C.inkSoft }}>office {money(l.officeCost)}</div>}
                     </div>
                     <button onClick={() => removePlanLine(l.lineId)} className="p-1.5 rounded-md" style={{ color: C.clay }}>
@@ -1893,22 +2234,24 @@ export default function GajerPeptideApp() {
                   <div className="mt-4 rounded-lg p-3 flex items-center justify-between" style={{ background: C.tealSoft }}>
                     <div className="text-sm font-medium" style={{ color: C.tealDark }}>Treatment plan total</div>
                     <div className="text-right">
-                      <div className="text-lg font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{money(planTotals.patient)}</div>
+                      <div className="text-lg font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{money(planDiscountResult.final)}</div>
+                      {patientTier > 0 && planTotals.patient - planTierTotal > 0.004 && <div className="text-xs" style={{ color: C.success }}>{TIER_LABELS[patientTier]} membership saves {money(planTotals.patient - planTierTotal)}</div>}
+                      {planDiscountResult.off > 0 && <div className="text-xs" style={{ color: C.amber }}>{money(planTierTotal)} − {money(planDiscountResult.off)} discount</div>}
                       {!patientMode && <div className="text-xs" style={{ color: C.tealDark }}>office cost {money(planTotals.office)}</div>}
                     </div>
                   </div>
-                  {!patientMode && (
-                        <>
-                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
-                          {recordStatus === "purchased" && (
+                  <DiscountControl className="mt-3" discount={planDiscount} onChange={setPlanDiscount} baseAmount={planTierTotal} />
+                  {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                          {recordStatus === "purchased" && (patientTier >= 2 ? (
+                            <TierShipNote tier={patientTier} />
+                          ) : (
                             <MembershipToggle
                               isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
                               intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
                               totalShipments={totalShipments} onTotalChange={setTotalShipments}
                             />
-                          )}
-                        </>
-                      )}
+                          ))}
+
                   <div className="flex gap-2 mt-3">
                     <button onClick={savePlanQuote} disabled={!activePatientId || isSaving} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium disabled:opacity-40" style={{ background: C.success, color: "white" }}>
                       <Save size={14} /> {isSaving ? "Saving…" : "Save treatment plan to patient"}
@@ -2085,7 +2428,9 @@ export default function GajerPeptideApp() {
                       <>
                         <div className="rounded-lg p-5 mb-3 text-center" style={{ background: C.tealSoft }}>
                           <div className="text-xs uppercase tracking-wide mb-1" style={{ color: C.inkSoft, letterSpacing: "0.08em" }}>Cost to patient</div>
-                          <div className="text-3xl font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{money(blendPatientTotal)}</div>
+                          <div className="text-3xl font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{money(blendFinal)}</div>
+                          {patientTier > 0 && blendTier.off > 0 && <div className="text-xs mt-1" style={{ color: C.amber }}>{tierLine(patientTier, blendTier)} · was {money(blendPatientTotal)}</div>}
+                          {blendDiscountResult.off > 0 && <div className="text-xs mt-1" style={{ color: C.amber }}>{discountLabel(blendDiscount)} · was {money(blendAfterTier)}</div>}
                         </div>
                         <div className="flex items-center gap-2 mb-3">
                           <span className="text-sm" style={{ color: C.inkSoft }}>Adjust this price</span>
@@ -2132,23 +2477,27 @@ export default function GajerPeptideApp() {
 
                         <div className="rounded-lg p-3 mb-3" style={{ background: C.tealSoft }}>
                           <LedgerRow label="Combined office cost" value={money(blendOfficeTotal)} />
-                          <LedgerRow label={blendUseFlat ? "Flat patient price" : `Patient price (${blendMultiplier}×)`} value={money(blendPatientTotal)} strong />
+                          <LedgerRow label={blendUseFlat ? "Flat patient price" : `Patient price (${blendMultiplier}×)`} value={money(blendPatientTotal)} strong={blendDiscountResult.off <= 0 && blendTier.off <= 0} />
+                          {patientTier > 0 && blendTier.off > 0 && <LedgerRow label={tierLine(patientTier, blendTier)} value={`−${money(blendTier.off)}`} />}
+                          {blendDiscountResult.off > 0 && <LedgerRow label={`Discount (${discountLabel(blendDiscount)})`} value={`−${money(blendDiscountResult.off)}`} />}
+                          {(blendDiscountResult.off > 0 || blendTier.off > 0) && <LedgerRow label="Patient pays" value={money(blendFinal)} strong />}
                         </div>
                       </>
                     )}
 
-                    {!patientMode && (
-                        <>
-                          <StatusToggle value={recordStatus} onChange={setRecordStatus} />
-                          {recordStatus === "purchased" && (
+                    <DiscountControl className="mb-3" discount={blendDiscount} onChange={setBlendDiscount} baseAmount={blendAfterTier} />
+
+                    {!patientMode && <StatusToggle value={recordStatus} onChange={setRecordStatus} />}
+                          {recordStatus === "purchased" && (patientTier >= 2 ? (
+                            <TierShipNote tier={patientTier} />
+                          ) : (
                             <MembershipToggle
                               isMembership={isMembershipSupply} onToggle={setIsMembershipSupply}
                               intervalDays={supplyIntervalDays} onIntervalChange={setSupplyIntervalDays}
                               totalShipments={totalShipments} onTotalChange={setTotalShipments}
                             />
-                          )}
-                        </>
-                      )}
+                          ))}
+
                     <div className="flex flex-wrap gap-2">
                       <button onClick={addBlendToPlan} className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium" style={{ background: C.successSoft, color: C.success }}>
                         <Plus size={14} /> Add blend to treatment plan
@@ -2222,6 +2571,21 @@ export default function GajerPeptideApp() {
                             >
                               Preview / Export
                             </button>
+                            {confirmRemoveId === `record:${r.id}` ? (
+                              <>
+                                <span className="text-xs" style={{ color: C.clay }}>
+                                  Remove this {r.type === "plan" ? "plan" : "quote"}?{allOrders.filter((o) => o.visitId === r.id).length > 0 ? ` Its ${allOrders.filter((o) => o.visitId === r.id).length} order(s) are removed too.` : ""}
+                                </span>
+                                <button onClick={() => removeRecord(r)} disabled={removingId === r.id} className="text-xs px-2 py-1 rounded-md font-medium disabled:opacity-50" style={{ background: C.clay, color: "white" }}>
+                                  {removingId === r.id ? "Removing…" : "Yes, remove"}
+                                </button>
+                                <button onClick={() => setConfirmRemoveId(null)} className="text-xs px-2 py-1 rounded-md" style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}>Cancel</button>
+                              </>
+                            ) : (
+                              <button onClick={() => setConfirmRemoveId(`record:${r.id}`)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-md" style={{ border: `1px solid ${C.clay}`, color: C.clay }}>
+                                <Trash2 size={12} /> Remove
+                              </button>
+                            )}
                           </div>
                         </div>
                         <div className="text-xs" style={{ color: C.inkSoft }}>
@@ -2373,6 +2737,7 @@ export default function GajerPeptideApp() {
                             <td className="px-2 py-2">
                               <input
                                 type="text" defaultValue={o.notes || ""}
+                                key={`notes-${o.lineId}-${o.notes || ""}`}
                                 onBlur={(e) => { if (e.target.value !== (o.notes || "")) updateOrderField(o.lineId, { notes: e.target.value }); }}
                                 placeholder="—"
                                 className="text-xs px-1.5 py-1 rounded-md outline-none w-32"
@@ -2410,6 +2775,27 @@ export default function GajerPeptideApp() {
                                         <span>total shipments</span>
                                       </div>
                                       {o.lastShipmentBy && <div className="mt-1.5" style={{ color: C.inkSoft }}>Last shipment marked sent by {o.lastShipmentBy}</div>}
+                                      {o.shipmentStatus !== "Membership Complete" && o.nextShipDue && (
+                                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                          <span>Patient away or running long? Move the next shipment to</span>
+                                          <input
+                                            type="date"
+                                            value={pushDates[o.lineId] || ""}
+                                            min={new Date().toISOString().slice(0, 10)}
+                                            onChange={(e) => setPushDates((prev) => ({ ...prev, [o.lineId]: e.target.value }))}
+                                            className="px-1.5 py-0.5 rounded-md text-xs outline-none"
+                                            style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO, background: C.card }}
+                                          />
+                                          <button
+                                            onClick={() => pushShipment(o.lineId)}
+                                            disabled={!pushDates[o.lineId] || ordersSavingId === o.lineId}
+                                            className="px-2 py-0.5 rounded-md text-xs font-medium disabled:opacity-40"
+                                            style={{ border: `1px solid ${C.teal}`, color: C.tealDark, background: C.card }}
+                                          >
+                                            Move date
+                                          </button>
+                                        </div>
+                                      )}
                                     </div>
                                     {o.shipmentStatus !== "Membership Complete" && (
                                       <button
@@ -2448,6 +2834,23 @@ export default function GajerPeptideApp() {
                                     </select>
                                   </div>
                                   <div><span style={{ color: C.inkSoft }}>Visit ID</span><div className="font-medium" style={{ color: C.inkSoft, fontFamily: FONT_MONO, fontSize: 10 }}>{o.visitId}</div></div>
+                                </div>
+                                <div className="mt-3 pt-3 flex items-center justify-end gap-2 flex-wrap" style={{ borderTop: `1px solid ${C.line}` }}>
+                                  {confirmRemoveId === `order:${o.lineId}` ? (
+                                    <>
+                                      <span className="text-xs" style={{ color: C.clay }}>
+                                        Remove this order?{o.paymentStatus === "paid" ? " It is marked PAID." : ""} It disappears from the app and is marked Removed in the sheet.
+                                      </span>
+                                      <button onClick={() => removeOrder(o.lineId)} disabled={removingId === o.lineId} className="text-xs px-3 py-1.5 rounded-md font-medium disabled:opacity-50" style={{ background: C.clay, color: "white" }}>
+                                        {removingId === o.lineId ? "Removing…" : "Yes, remove"}
+                                      </button>
+                                      <button onClick={() => setConfirmRemoveId(null)} className="text-xs px-3 py-1.5 rounded-md" style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}>Cancel</button>
+                                    </>
+                                  ) : (
+                                    <button onClick={() => setConfirmRemoveId(`order:${o.lineId}`)} className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-md" style={{ border: `1px solid ${C.clay}`, color: C.clay }}>
+                                      <Trash2 size={12} /> Remove this order
+                                    </button>
+                                  )}
                                 </div>
                               </td>
                             </tr>
@@ -2609,7 +3012,7 @@ export default function GajerPeptideApp() {
                       {fields.perMg && <div className="text-xs mb-1" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>{money(l.vendor.wholesalePrice / l.vendor.strengthMg)}/mg office</div>}
                       <div className="flex gap-4 mt-1">
                         {fields.office && <div className="text-sm" style={{ fontFamily: FONT_MONO }}>Office: {money(l.officeCost)}</div>}
-                        {fields.patient && <div className="text-sm font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>Patient: {money(l.patientCost)}</div>}
+                        {fields.patient && <div className="text-sm font-semibold" style={{ fontFamily: FONT_MONO, color: C.amber }}>{l.covered ? `Covered by ${TIER_LABELS[clampTier(l.tier)]} membership` : `Patient: ${money(l.patientCost)}`}</div>}
                       </div>
                     </div>
                   ))}
