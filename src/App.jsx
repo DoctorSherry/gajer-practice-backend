@@ -201,6 +201,32 @@ function applyShipping(lines, { purchased, manual }) {
 }
 // </TIER-LOGIC>
 
+// <PEN-LOGIC>
+// Dosing pens: one click (unit) is 0.01 mL, so the catalog hands us mg per click for each
+// ingredient. Units per dose = dose mg / mg per click. Only single-ingredient pens get this:
+// for blends the sheet gives one dose number for several ingredients, so there is no honest
+// way to say how many clicks that is. Returns null whenever we can't be sure.
+function penGuide(vendor, doseMg, freqPerWeek) {
+  const pen = vendor && vendor.pen;
+  const dose = Number(doseMg) || 0;
+  if (!pen || !pen.unitsOk || !pen.mgPerClick || pen.mgPerClick.length !== 1 || dose <= 0) return null;
+  const perClick = pen.mgPerClick[0];
+  if (!(perClick > 0)) return null;
+  const raw = dose / perClick;
+  const units = Math.round(raw * 10) / 10;
+  const whole = Math.abs(raw - Math.round(raw)) < 0.05;
+  const perWeek = dose * (Number(freqPerWeek) || 0);
+  const strength = Number(vendor.strengthMg) || 0;
+  const daysPerPen = perWeek > 0 && strength > 0 ? Math.floor((strength / perWeek) * 7) : 0;
+  return { unitsPerDose: whole ? Math.round(raw) : units, whole, daysPerPen };
+}
+function penGuideText(g) {
+  if (!g) return "";
+  const u = g.unitsPerDose;
+  return `Take ${g.whole ? "" : "about "}${u} unit${u === 1 ? "" : "s"} per dose${g.daysPerPen > 0 ? ` · one pen lasts about ${g.daysPerPen} days` : ""}`;
+}
+// </PEN-LOGIC>
+
 const STRIPS_PER_BOX = 30; // the sheet's price/strength for "Strip" items describes a whole box, not one strip
 
 function buildDatabase(vendors, protocols) {
@@ -217,6 +243,7 @@ function buildDatabase(vendors, protocols) {
       rawStrength: v.rawStrength,
       rawUnitValue: v.rawUnitValue,
       wholesalePrice: Number(v.wholesalePrice),
+      pen: v.pen || null,
     });
   });
   protocols.forEach((p) => {
@@ -1069,6 +1096,7 @@ export default function GajerPeptideApp() {
 
   const selectedVendor = vendorRows.find((v) => v.id === selectedVendorId) || vendorRows[0] || null;
   const officeCost = selectedVendor ? selectedVendor.computed.costOffice : 0;
+  const currentPenGuide = selectedVendor && !usePhased && doseUnit === "mg" ? penGuide(selectedVendor, config.doseMg, config.freqPerWeek) : null;
   const priceBeforeDiscount = useFlat && flatOverride != null ? flatOverride : officeCost * multiplier;
   const singleTier = tierPricing([priceBeforeDiscount], patientTier)[0]; // membership first…
   const priceAfterTier = singleTier.final;
@@ -1153,6 +1181,7 @@ export default function GajerPeptideApp() {
       totalMg,
       vendor: selectedVendor ? { format: selectedVendor.format, strengthMg: selectedVendor.strengthMg, wholesalePrice: selectedVendor.wholesalePrice, rawStrength: selectedVendor.rawStrength } : null,
       unitsNeeded: selectedVendor ? selectedVendor.computed.unitsNeeded : 0,
+      penGuide: !usePhased && doseUnit === "mg" ? penGuide(selectedVendor, config.doseMg, config.freqPerWeek) : null,
       officeCost,
       multiplier,
       flatOverride: useFlat ? flatOverride : null,
@@ -2114,6 +2143,8 @@ export default function GajerPeptideApp() {
                           <div className="rounded-lg p-3 mb-4" style={{ background: C.paper, fontFamily: FONT_MONO, fontSize: 13 }}>
                             <LedgerRow label={`${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
+                            {currentPenGuide && <LedgerRow label="Pen: take per dose" value={`${currentPenGuide.whole ? "" : "≈ "}${currentPenGuide.unitsPerDose} unit${currentPenGuide.unitsPerDose === 1 ? "" : "s"}`} />}
+                            {currentPenGuide && currentPenGuide.daysPerPen > 0 && <LedgerRow label="One pen lasts" value={`≈ ${currentPenGuide.daysPerPen} days`} sub />}
                             <LedgerRow label={useFlat ? "Flat patient price" : `Patient price (${multiplier}×)`} value={money(priceBeforeDiscount)} strong={singleDiscountResult.off <= 0 && singleTier.off <= 0} />
                             {patientTier > 0 && singleTier.off > 0 && <LedgerRow label={tierLine(patientTier, singleTier)} value={`−${money(singleTier.off)}`} />}
                             {singleDiscountResult.off > 0 && <LedgerRow label={`Discount (${discountLabel(singleDiscount)})`} value={`−${money(singleDiscountResult.off)}`} />}
@@ -2202,7 +2233,7 @@ export default function GajerPeptideApp() {
                         </div>
                       ) : (
                         <div className="text-xs mt-0.5" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>
-                          {l.vendor.format} · {l.vendor.strengthMg}mg — {fmtMg(l.totalMg)} course · {l.unitsNeeded} unit(s)
+                          {l.vendor.format} · {l.vendor.strengthMg}mg — {fmtMg(l.totalMg)} course · {l.unitsNeeded} unit(s){l.penGuide ? ` · ${penGuideText(l.penGuide)}` : ""}
                         </div>
                       )}
                     </div>
@@ -3010,6 +3041,7 @@ export default function GajerPeptideApp() {
                         </div>
                       )}
                       {fields.vendor && <div className="text-xs mb-1" style={{ color: C.inkSoft }}>Product: {l.vendor.format}, {l.vendor.strengthMg}mg ({l.unitsNeeded} unit{l.unitsNeeded === 1 ? "" : "s"})</div>}
+                      {l.penGuide && <div className="text-xs mb-1" style={{ color: C.ink }}>{penGuideText(l.penGuide)}</div>}
                       {fields.perMg && <div className="text-xs mb-1" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>{money(l.vendor.wholesalePrice / l.vendor.strengthMg)}/mg office</div>}
                       <div className="flex gap-4 mt-1">
                         {fields.office && <div className="text-sm" style={{ fontFamily: FONT_MONO }}>Office: {money(l.officeCost)}</div>}

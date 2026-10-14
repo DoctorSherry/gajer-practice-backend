@@ -1,5 +1,6 @@
 const { readRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
+const { penVendors } = require("./_lib/pens");
 const { rowsToObjects, pickField, toNumber, parseStrengthInfo, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
 const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", "peptide name"];
@@ -17,6 +18,9 @@ exports.handler = async (event) => {
   try {
     await verifyRequest(event);
 
+    // Pens live on their own tab of the same workbook. If that tab is missing or unreadable the
+    // rest of the catalog must still load, so a failure here is reported, not thrown.
+    const pensPromise = readRange(process.env.VENDOR_SHEET_ID, process.env.PENS_RANGE || "Pens").catch((e) => ({ error: e.message }));
     const [vendorRows, protocolRows] = await Promise.all([
       readRange(process.env.VENDOR_SHEET_ID, process.env.VENDOR_RANGE || "Sheet1"),
       readRange(process.env.PROTOCOL_SHEET_ID, process.env.PROTOCOL_RANGE || "Sheet1"),
@@ -49,7 +53,12 @@ exports.handler = async (event) => {
       }))
       .filter((p) => p.name);
 
-    return json(200, { vendors, protocols, fetchedAt: new Date().toISOString() });
+    const pensRaw = await pensPromise;
+    let pensError = null;
+    if (Array.isArray(pensRaw)) vendors.push(...penVendors(pensRaw));
+    else pensError = pensRaw.error;
+
+    return json(200, { vendors, protocols, pensError, fetchedAt: new Date().toISOString() });
   } catch (err) {
     return errorResponse(err);
   }
