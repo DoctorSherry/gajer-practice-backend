@@ -2143,6 +2143,7 @@ export default function GajerPeptideApp() {
                           <div className="rounded-lg p-3 mb-4" style={{ background: C.paper, fontFamily: FONT_MONO, fontSize: 13 }}>
                             <LedgerRow label={`${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
+                            {!patientMode && selectedVendor.pen && !currentPenGuide && selectedVendor.pen.unitsOk === false && <LedgerRow label="Pen units" value="not available — see Pens sheet" sub />}
                             {currentPenGuide && <LedgerRow label="Pen: take per dose" value={`${currentPenGuide.whole ? "" : "≈ "}${currentPenGuide.unitsPerDose} unit${currentPenGuide.unitsPerDose === 1 ? "" : "s"}`} />}
                             {currentPenGuide && currentPenGuide.daysPerPen > 0 && <LedgerRow label="One pen lasts" value={`≈ ${currentPenGuide.daysPerPen} days`} sub />}
                             <LedgerRow label={useFlat ? "Flat patient price" : `Patient price (${multiplier}×)`} value={money(priceBeforeDiscount)} strong={singleDiscountResult.off <= 0 && singleTier.off <= 0} />
