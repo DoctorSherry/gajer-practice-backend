@@ -187,6 +187,15 @@ function courseWeeksOf(line) {
 function coveredShipmentCount(line, intervalDays = 30) {
   return Math.max(1, Math.ceil((courseWeeksOf(line) * 7) / intervalDays));
 }
+// How a covered line ships. Membership billing stays monthly, but shipments follow how long the
+// medication actually lasts (Patrick): for a pen that is one pen per shipment, spaced by the days
+// one pen lasts. Anything else keeps the monthly (30-day) rhythm.
+function shipPlanFor(line, intervalDays = 30) {
+  const g = line && line.penGuide;
+  const pens = Math.round(Number(line && line.unitsNeeded) || 0);
+  if (g && g.daysPerPen > 0 && pens >= 1) return { interval: g.daysPerPen, total: pens, bySupply: true };
+  return { interval: intervalDays, total: coveredShipmentCount(line, intervalDays), bySupply: false };
+}
 // Decides, at save time, which lines ship in installments. Covered lines (Tier 2/3) ship a
 // month at a time automatically. For patients without a covering tier, the manual
 // Membership box applies if it was ticked. Nothing ships on a consultation-only save.
@@ -194,7 +203,7 @@ function applyShipping(lines, { purchased, manual }) {
   return lines.map((l) => {
     const base = { ...l, isMembership: false };
     if (!purchased) return base;
-    if (l.covered) return { ...base, isMembership: true, supplyIntervalDays: 30, totalShipments: coveredShipmentCount(l, 30) };
+    if (l.covered) { const plan = shipPlanFor(l, 30); return { ...base, isMembership: true, supplyIntervalDays: plan.interval, totalShipments: plan.total }; }
     if (manual) return { ...base, isMembership: true, supplyIntervalDays: manual.interval, totalShipments: manual.total };
     return base;
   });
@@ -203,27 +212,45 @@ function applyShipping(lines, { purchased, manual }) {
 
 // <PEN-LOGIC>
 // Dosing pens: one click (unit) is 0.01 mL, so the catalog hands us mg per click for each
-// ingredient. Units per dose = dose mg / mg per click. Only single-ingredient pens get this:
-// for blends the sheet gives one dose number for several ingredients, so there is no honest
-// way to say how many clicks that is. Returns null whenever we can't be sure.
+// ingredient. Units per dose = dose mg / mg per click.
+// Blend pens (Patrick): the protocol dose and the units are for the ONE ingredient with the
+// largest amount in the pen (the first listed if several tie) — the ingredients are never added
+// together. The catalog marks that ingredient as pen.refIndex.
+function penRefIndex(pen) {
+  const n = pen && pen.components ? pen.components.length : 0;
+  const i = Number(pen && pen.refIndex);
+  return n > 1 && Number.isInteger(i) && i >= 0 && i < n ? i : 0;
+}
+// How many mg of the dosed ingredient one pen holds. For a blend pen that is the reference
+// ingredient, not the sum of everything in the pen; for any other product it is the label strength.
+function effectivePenStrength(vendor) {
+  const pen = vendor && vendor.pen;
+  if (pen && pen.components && pen.components.length > 1) {
+    const mg = Number(pen.components[penRefIndex(pen)]);
+    if (mg > 0) return mg;
+  }
+  return Number(vendor && vendor.strengthMg) || 0;
+}
+// Returns null whenever we can't be sure (no pen data, a sheet row left blank, no dose).
 function penGuide(vendor, doseMg, freqPerWeek) {
   const pen = vendor && vendor.pen;
   const dose = Number(doseMg) || 0;
-  if (!pen || !pen.unitsOk || !pen.mgPerClick || pen.mgPerClick.length !== 1 || dose <= 0) return null;
-  const perClick = pen.mgPerClick[0];
+  if (!pen || !pen.unitsOk || !pen.mgPerClick || !pen.mgPerClick.length || dose <= 0) return null;
+  const ri = pen.mgPerClick.length > 1 ? penRefIndex(pen) : 0;
+  const perClick = pen.mgPerClick[ri];
   if (!(perClick > 0)) return null;
   const raw = dose / perClick;
   const units = Math.round(raw * 10) / 10;
   const whole = Math.abs(raw - Math.round(raw)) < 0.05;
   const perWeek = dose * (Number(freqPerWeek) || 0);
-  const strength = Number(vendor.strengthMg) || 0;
+  const strength = effectivePenStrength(vendor);
   const daysPerPen = perWeek > 0 && strength > 0 ? Math.floor((strength / perWeek) * 7) : 0;
-  return { unitsPerDose: whole ? Math.round(raw) : units, whole, daysPerPen };
+  return { unitsPerDose: whole ? Math.round(raw) : units, whole, daysPerPen, refName: pen.mgPerClick.length > 1 ? (pen.refName || null) : null };
 }
 function penGuideText(g) {
   if (!g) return "";
   const u = g.unitsPerDose;
-  return `Take ${g.whole ? "" : "about "}${u} unit${u === 1 ? "" : "s"} per dose${g.daysPerPen > 0 ? ` · one pen lasts about ${g.daysPerPen} days` : ""}`;
+  return `Take ${g.whole ? "" : "about "}${u} unit${u === 1 ? "" : "s"} per dose${g.refName ? ` (dose is for ${g.refName})` : ""}${g.daysPerPen > 0 ? ` · one pen lasts about ${g.daysPerPen} days` : ""}`;
 }
 // </PEN-LOGIC>
 
@@ -297,7 +324,7 @@ function computeVendorLine(vendor, totalMg, totalDays, doseUnit) {
     return { unitsNeeded: 0, costOffice: 0, perMgRate: 0, wasteMg: 0, pricePerItem, manualRequired: true, unitMismatch: true };
   }
 
-  const strengthMg = vendor.strengthMg || 0;
+  const strengthMg = effectivePenStrength(vendor); // blend pens: the dosed ingredient's amount, not the sum
   const unitsNeeded = totalMg > 0 && strengthMg > 0 ? Math.ceil(totalMg / strengthMg) : 0;
   const costOffice = unitsNeeded * pricePerItem;
   const perMgRate = strengthMg > 0 ? pricePerItem / strengthMg : 0;
@@ -523,6 +550,62 @@ function TierSelector({ tier, onChange, disabled, status, onRetry }) {
   );
 }
 
+// Tier 1: peptide selections are final. The patient ticks this before a purchase can be saved.
+function Tier1Notice({ ack, onChange }) {
+  return (
+    <div className="mt-2 p-3 rounded-lg text-sm" style={{ background: C.amberSoft, border: `1.5px solid ${C.amber}`, color: C.ink }}>
+      <div className="font-medium mb-1">Tier 1 membership: peptide selections are final</div>
+      <div className="text-xs mb-2" style={{ color: C.inkSoft }}>
+        Once an order is placed, the peptides chosen cannot be changed, and the order is not eligible for refunds.
+      </div>
+      <label className="flex items-center gap-2 text-xs font-medium cursor-pointer">
+        <input type="checkbox" checked={ack} onChange={(e) => onChange(e.target.checked)} />
+        The patient has read this and agrees (required before the order is saved)
+      </label>
+    </div>
+  );
+}
+
+// Pause / restart a membership. A pause stops medication shipments and membership billing and stays
+// until someone restarts it. The first pause is meant to last up to `limit` days.
+function PauseControl({ tier, pausedSince, pausedDays, limit, busy, onPause, onRestart }) {
+  const [confirming, setConfirming] = useState(false);
+  if (tier < 1) return null;
+  if (pausedSince) {
+    const over = pausedDays > limit;
+    return (
+      <div className="mt-2 p-3 rounded-lg text-sm flex items-center justify-between gap-3" style={{ background: over ? C.claySoft : C.amberSoft, border: `1.5px solid ${over ? C.clay : C.amber}`, color: C.ink }}>
+        <div>
+          <div className="font-medium">Membership paused since {pausedSince} · {pausedDays} day{pausedDays === 1 ? "" : "s"}</div>
+          <div className="text-xs" style={{ color: C.inkSoft }}>
+            Shipments and billing are on hold until it is restarted — it will not restart by itself.
+            {over ? ` This is past the ${limit}-day pause limit.` : ` Pauses are allowed for up to ${limit} days.`}
+          </div>
+        </div>
+        <button onClick={onRestart} disabled={busy} className="text-xs px-3 py-1.5 rounded-md font-medium whitespace-nowrap disabled:opacity-50" style={{ background: C.success, color: "white" }}>
+          {busy ? "Restarting…" : "Restart membership"}
+        </button>
+      </div>
+    );
+  }
+  if (confirming) {
+    return (
+      <div className="mt-2 flex items-center gap-2 text-xs" style={{ color: C.inkSoft }}>
+        Pause shipments and billing until someone restarts it (up to {limit} days)?
+        <button onClick={() => { setConfirming(false); onPause(); }} disabled={busy} className="px-2.5 py-1 rounded-md font-medium disabled:opacity-50" style={{ background: C.amber, color: "white" }}>Yes, pause</button>
+        <button onClick={() => setConfirming(false)} className="px-2.5 py-1 rounded-md font-medium" style={{ border: `1px solid ${C.line}` }}>Cancel</button>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2">
+      <button onClick={() => setConfirming(true)} disabled={busy} className="text-xs px-2.5 py-1 rounded-md font-medium disabled:opacity-50" style={{ border: `1px solid ${C.line}`, color: C.inkSoft }}>
+        Pause membership
+      </button>
+    </div>
+  );
+}
+
 // Replaces the manual Membership box for Tier 2/3 patients — shipments are automatic for covered items.
 function TierShipNote({ tier }) {
   return (
@@ -599,6 +682,11 @@ export default function GajerPeptideApp() {
   const [tierStatus, setTierStatus] = useState("idle"); // idle | loading | ok | error — saves wait until "ok" so a member is never priced as a non-member
   const [tierSaving, setTierSaving] = useState(false);
   const [tierReload, setTierReload] = useState(0);
+  const [pausedSince, setPausedSince] = useState(""); // "" = membership not paused; otherwise the M/D/YYYY the pause started
+  const [pausedDays, setPausedDays] = useState(0);
+  const [pauseLimit, setPauseLimit] = useState(60);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const [tier1Ack, setTier1Ack] = useState(false); // Tier 1: patient has acknowledged "final sale, no refunds or peptide changes"
   const [pushDates, setPushDates] = useState({}); // lineId -> date chosen for "push next shipment"
 
   const [query, setQuery] = useState("");
@@ -847,7 +935,7 @@ export default function GajerPeptideApp() {
 
   /* ---------- backend: load the active patient's membership tier ---------- */
   useEffect(() => {
-    if (!activePatientId || !idToken) { setPatientTier(0); setTierStatus("idle"); return; }
+    if (!activePatientId || !idToken) { setPatientTier(0); setPausedSince(""); setTier1Ack(false); setTierStatus("idle"); return; }
     let cancelled = false;
     setTierStatus("loading");
     (async () => {
@@ -855,10 +943,15 @@ export default function GajerPeptideApp() {
         const data = await authFetch(`/tiers?patientId=${encodeURIComponent(activePatientId)}`);
         if (cancelled) return;
         setPatientTier(clampTier(data.tier));
+        setPausedSince(data.pausedSince || "");
+        setPausedDays(Number(data.pausedDays) || 0);
+        setPauseLimit(Number(data.pauseLimitDays) || 60);
+        setTier1Ack(false);
         setTierStatus("ok");
       } catch {
         if (cancelled) return;
         setPatientTier(0);
+        setPausedSince("");
         setTierStatus("error");
       }
     })();
@@ -867,8 +960,10 @@ export default function GajerPeptideApp() {
 
   async function changeTier(next) {
     if (!activePatientId || tierSaving) return;
+    if (pausedSince) { showToast("This membership is paused — restart it before changing the tier."); return; }
     const previous = patientTier;
     setPatientTier(next);
+    setTier1Ack(false);
     setTierSaving(true);
     try {
       await authFetch("/tiers", { method: "POST", body: JSON.stringify({ patientId: activePatientId, tier: next }) });
@@ -878,6 +973,41 @@ export default function GajerPeptideApp() {
       showToast(`Couldn't change the tier: ${err.message}`);
     } finally {
       setTierSaving(false);
+    }
+  }
+
+  async function pauseMembership() {
+    if (!activePatientId || pauseBusy) return;
+    setPauseBusy(true);
+    try {
+      const r = await authFetch("/tiers", { method: "POST", body: JSON.stringify({ patientId: activePatientId, action: "pause" }) });
+      setPausedSince(r.pausedSince || "");
+      setPausedDays(Number(r.pausedDays) || 0);
+      showToast(`${activePatientId}: membership paused — shipments and billing are on hold`);
+      loadOrders();
+    } catch (err) {
+      showToast(`Couldn't pause the membership: ${err.message}`);
+    } finally {
+      setPauseBusy(false);
+    }
+  }
+  async function restartMembership() {
+    if (!activePatientId || pauseBusy) return;
+    setPauseBusy(true);
+    try {
+      const r = await authFetch("/tiers", { method: "POST", body: JSON.stringify({ patientId: activePatientId, action: "resume" }) });
+      setPausedSince("");
+      setPausedDays(0);
+      const moved = Number(r.shipmentsMoved) || 0;
+      const failed = Number(r.shipmentsNotMoved) || 0;
+      showToast(failed > 0
+        ? `Membership restarted, but ${failed} shipment date${failed === 1 ? "" : "s"} couldn't be moved — check Orders`
+        : `Membership restarted${moved ? ` — ${moved} shipment date${moved === 1 ? "" : "s"} moved out by ${r.pausedForDays} day${r.pausedForDays === 1 ? "" : "s"}` : ""}`);
+      loadOrders();
+    } catch (err) {
+      showToast(`Couldn't restart the membership: ${err.message}`);
+    } finally {
+      setPauseBusy(false);
     }
   }
 
@@ -1022,11 +1152,16 @@ export default function GajerPeptideApp() {
       if (!activePatientId) return false;
       if (!idToken) { setPatientIdError("Please sign in with Google first."); return false; }
       if (tierStatus !== "ok" || tierSaving) { setPatientIdError("This patient's membership tier hasn't loaded yet — wait a moment, or use Retry, before saving."); return false; }
+      const isPurchaseRecord = record.status !== "consulted";
+      if (isPurchaseRecord && pausedSince) { setPatientIdError("This patient's membership is paused. Restart it before saving a purchase."); return false; }
+      if (isPurchaseRecord && patientTier === 1 && !tier1Ack) { setPatientIdError("Tier 1: the patient needs to acknowledge that peptide selections are final (no refunds or changes) before the order is saved. Tick the box under the patient bar."); return false; }
       if (savingRef.current) return false; // a save is already running — ignore the extra click
       savingRef.current = true;
       setIsSaving(true);
       let ok = false;
       try {
+        // Tier 1 purchases carry the patient's acknowledgment on every line (it ends up in Orders notes).
+        if (isPurchaseRecord && patientTier === 1 && tier1Ack) record = { ...record, lines: record.lines.map((l) => ({ ...l, tier1Ack: true })) };
         const saved = await authFetch("/quotes", {
           method: "POST",
           body: JSON.stringify({ patientId: activePatientId, ...record }),
@@ -1034,6 +1169,7 @@ export default function GajerPeptideApp() {
         setPatientHistory((prev) => ({ ...prev, [activePatientId]: [saved, ...(prev[activePatientId] || [])] }));
         addPatientIdLocally(activePatientId);
         ok = true;
+        if (isPurchaseRecord) setTier1Ack(false);
         showToast(`${record.status === "consulted" ? "Consultation" : "Purchase"} saved to ${activePatientId}`);
         // Parallel write to the shared Orders sheet — one row per peptide,
         // visible to the whole team for payment/fulfillment tracking.
@@ -1061,7 +1197,7 @@ export default function GajerPeptideApp() {
       }
       return ok;
     },
-    [activePatientId, idToken, tierStatus, tierSaving]
+    [activePatientId, idToken, tierStatus, tierSaving, pausedSince, patientTier, tier1Ack]
   );
 
   /* ---------- derived selection ---------- */
@@ -1681,7 +1817,7 @@ export default function GajerPeptideApp() {
                 <Tag tone="green" icon={<CheckCircle2 size={12} />}>
                   Active: {activePatientId} · {historyList.length} record{historyList.length === 1 ? "" : "s"}
                 </Tag>
-                <TierSelector tier={patientTier} status={tierStatus} disabled={tierSaving} onChange={changeTier} onRetry={() => setTierReload((n) => n + 1)} />
+                <TierSelector tier={patientTier} status={tierStatus} disabled={tierSaving || !!pausedSince} onChange={changeTier} onRetry={() => setTierReload((n) => n + 1)} />
                 {historyList.length > 0 && (
                   <button
                     onClick={() => setActiveTab("history")}
@@ -1701,6 +1837,10 @@ export default function GajerPeptideApp() {
               </>
             )}
           </div>
+          {activePatientId && tierStatus === "ok" && patientTier === 1 && <Tier1Notice ack={tier1Ack} onChange={setTier1Ack} />}
+          {activePatientId && tierStatus === "ok" && !patientMode && (
+            <PauseControl tier={patientTier} pausedSince={pausedSince} pausedDays={pausedDays} limit={pauseLimit} busy={pauseBusy} onPause={pauseMembership} onRestart={restartMembership} />
+          )}
           <div className="flex items-center justify-between mt-1.5 relative">
             <div className="text-xs" style={{ color: patientIdError ? C.clay : C.inkSoft }}>
               {patientIdError || "Type an ID and click \u201cCreate new patient\u201d, leave it blank to auto-generate one, or \u201cFind existing\u201d to pull up a saved record."}
@@ -2145,6 +2285,7 @@ export default function GajerPeptideApp() {
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
                             {!patientMode && selectedVendor.pen && !currentPenGuide && selectedVendor.pen.unitsOk === false && <LedgerRow label="Pen units" value="not available — see Pens sheet" sub />}
                             {currentPenGuide && <LedgerRow label="Pen: take per dose" value={`${currentPenGuide.whole ? "" : "≈ "}${currentPenGuide.unitsPerDose} unit${currentPenGuide.unitsPerDose === 1 ? "" : "s"}`} />}
+                            {currentPenGuide && currentPenGuide.refName && <LedgerRow label="Dose applies to" value={currentPenGuide.refName} sub />}
                             {currentPenGuide && currentPenGuide.daysPerPen > 0 && <LedgerRow label="One pen lasts" value={`≈ ${currentPenGuide.daysPerPen} days`} sub />}
                             <LedgerRow label={useFlat ? "Flat patient price" : `Patient price (${multiplier}×)`} value={money(priceBeforeDiscount)} strong={singleDiscountResult.off <= 0 && singleTier.off <= 0} />
                             {patientTier > 0 && singleTier.off > 0 && <LedgerRow label={tierLine(patientTier, singleTier)} value={`−${money(singleTier.off)}`} />}
@@ -2713,7 +2854,7 @@ export default function GajerPeptideApp() {
                       .slice()
                       .sort((a, b) => {
                         if (ordersSortMode !== "shipmentDue") return 0; // keep existing newest-first order from the API
-                        const rank = { "Overdue": 0, "Due Today": 1, "Due Soon": 2, "Scheduled": 3, "Membership Complete": 5 };
+                        const rank = { "Overdue": 0, "Due Today": 1, "Due Soon": 2, "Scheduled": 3, "Paused": 4, "Membership Complete": 5 };
                         const ra = a.shipmentStatus ? (rank[a.shipmentStatus] ?? 4) : 4;
                         const rb = b.shipmentStatus ? (rank[b.shipmentStatus] ?? 4) : 4;
                         if (ra !== rb) return ra - rb;
@@ -2760,7 +2901,7 @@ export default function GajerPeptideApp() {
                             <td className="px-2 py-2">
                               {o.isMembership === "Y" ? (
                                 <div className="flex flex-col gap-0.5">
-                                  <Tag tone={o.shipmentStatus === "Overdue" ? "clay" : (o.shipmentStatus === "Due Today" || o.shipmentStatus === "Due Soon") ? "amber" : o.shipmentStatus === "Membership Complete" ? "green" : "teal"}>
+                                  <Tag tone={o.shipmentStatus === "Paused" ? "amber" : o.shipmentStatus === "Overdue" ? "clay" : (o.shipmentStatus === "Due Today" || o.shipmentStatus === "Due Soon") ? "amber" : o.shipmentStatus === "Membership Complete" ? "green" : "teal"}>
                                     {o.shipmentStatus}
                                   </Tag>
                                   <span className="text-xs" style={{ color: C.inkSoft }}>{o.shipmentsSent}/{o.totalShipments} sent</span>
@@ -2808,7 +2949,7 @@ export default function GajerPeptideApp() {
                                         <span>total shipments</span>
                                       </div>
                                       {o.lastShipmentBy && <div className="mt-1.5" style={{ color: C.inkSoft }}>Last shipment marked sent by {o.lastShipmentBy}</div>}
-                                      {o.shipmentStatus !== "Membership Complete" && o.nextShipDue && (
+                                      {o.shipmentStatus !== "Membership Complete" && o.shipmentStatus !== "Paused" && o.nextShipDue && (
                                         <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                                           <span>Patient away or running long? Move the next shipment to</span>
                                           <input
@@ -2830,7 +2971,10 @@ export default function GajerPeptideApp() {
                                         </div>
                                       )}
                                     </div>
-                                    {o.shipmentStatus !== "Membership Complete" && (
+                                    {o.shipmentStatus === "Paused" && (
+                                      <span className="text-xs" style={{ color: C.amber }}>Membership paused — restart it to ship</span>
+                                    )}
+                                    {o.shipmentStatus !== "Membership Complete" && o.shipmentStatus !== "Paused" && (
                                       <button
                                         onClick={() => markShipmentSent(o.lineId)}
                                         className="text-xs px-3 py-1.5 rounded-md font-medium whitespace-nowrap"

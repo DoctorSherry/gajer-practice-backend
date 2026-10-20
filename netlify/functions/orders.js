@@ -3,7 +3,10 @@ const { readRange, appendRows, updateRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
 const { rowsToObjects, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
+const { readPauseMap, shiftedShipDate, daysBetween, todayNY } = require("./_lib/pause");
+
 const ORDERS_RANGE = process.env.ORDERS_RANGE || "Orders";
+const PATIENTS_RANGE = process.env.PATIENTS_RANGE || "Patients";
 
 // Orders tab header row (one row per peptide, shared across the whole team):
 //   Status | Date | Patient | Peptide | Dose | Frequency | Duration | Units | Patient Price |
@@ -60,8 +63,9 @@ function discountNote(d) {
 function tierNote(l) {
   const t = Number(l && l.tier);
   if (!t || t < 1 || t > 3) return "";
+  const ack = t === 1 && l.tier1Ack ? " · Patient acknowledged: peptide selections are final, no refunds or changes" : "";
   if (l.covered) return `Tier ${t} membership: covered`;
-  return `Tier ${t} membership: 10% off`;
+  return (t === 1 ? `Tier ${t} membership: 10% off` : `Tier ${t} membership`) + ack;
 }
 
 /** Joins the non-empty note parts with " · " */
@@ -124,6 +128,30 @@ function fieldsFromRow(r) {
   };
 }
 
+/** When a pause ends: move each of the patient's pending shipments out by the days they were paused.
+ * Returns { shifted, failed }. Rows already finished, removed, or with no due date are left alone. */
+async function shiftPatientShipments(sheetId, patientId, pausedSince, who) {
+  const today = todayNY();
+  const days = daysBetween(pausedSince, today);
+  const raw = await readRange(sheetId, ORDERS_RANGE);
+  const objs = rowsToObjects(raw);
+  const lastC = String.fromCharCode(65 + COLUMNS.length - 1);
+  let shifted = 0, failed = 0;
+  for (let i = 0; i < objs.length; i++) {
+    const f = fieldsFromRow(objs[i]);
+    if (!f.lineId || f.removedBy || f.patient !== patientId || f.isMembership !== "Y" || !f.nextShipDue) continue;
+    if (f.totalShipments > 0 && f.shipmentsSent >= f.totalShipments) continue;
+    const next = shiftedShipDate(f.nextShipDue, pausedSince, today);
+    if (!next || next === f.nextShipDue) continue;
+    try {
+      const updated = { ...f, nextShipDue: next, notes: joinNotes(f.notes, `Membership paused ${pausedSince} → restarted ${today} (${days} day${days === 1 ? "" : "s"}): next shipment moved ${f.nextShipDue} → ${next} by ${who}`) };
+      await updateRange(sheetId, `${ORDERS_RANGE}!A${i + 2}:${lastC}${i + 2}`, rowFromFields(updated));
+      shifted++;
+    } catch { failed++; }
+  }
+  return { shifted, failed, days };
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders(), body: "" };
   try {
@@ -135,7 +163,14 @@ exports.handler = async (event) => {
       let orders = rowsToObjects(rows).filter((r) => r.LineID).map(fieldsFromRow).filter((o) => !o.removedBy); // removed rows stay in the sheet, marked, but never show in the app
       if (patientId) orders = orders.filter((o) => o.patient === patientId);
       const today = new Date().toLocaleDateString("en-US", { timeZone: "America/New_York" });
-      orders = orders.map((o) => ({ ...o, shipmentStatus: computeShipmentStatus(o, today) }));
+      // Orders for a paused patient show "Paused" instead of a due date; the pause map is best-effort
+      // (if it can't be read, orders still load with their normal status).
+      let paused = {};
+      try { paused = await readPauseMap(readRange, process.env.APP_DATA_SHEET_ID, PATIENTS_RANGE); } catch { paused = {}; }
+      orders = orders.map((o) => {
+        const s = computeShipmentStatus(o, today);
+        return { ...o, shipmentStatus: s && s !== "Membership Complete" && paused[o.patient] ? "Paused" : s };
+      });
       orders.sort((a, b) => new Date(b.date) - new Date(a.date));
       return json(200, { orders });
     }
@@ -147,6 +182,10 @@ exports.handler = async (event) => {
         return json(400, { error: "patientId, type, and lines[] are required" });
       }
       const isPurchase = type === "purchase";
+      if (isPurchase) {
+        const paused = await readPauseMap(readRange, process.env.APP_DATA_SHEET_ID, PATIENTS_RANGE);
+        if (paused[patientId]) return json(409, { error: "This patient's membership is paused. Restart it before saving a purchase." });
+      }
       // When the saved quote's ID is passed in, reuse it as the VisitID so removing that
       // quote later can also remove the orders made with it.
       const visitId = typeof quoteId === "string" && quoteId.length > 0 && quoteId.length <= 100 ? quoteId : crypto.randomUUID();
@@ -255,6 +294,8 @@ exports.handler = async (event) => {
       const alreadyComplete = existing.isMembership === "Y" && Number(existing.totalShipments) > 0 &&
         Number(existing.shipmentsSent) >= Number(existing.totalShipments);
       if (markShipmentSent && existing.isMembership === "Y" && !alreadyComplete) {
+        const paused = await readPauseMap(readRange, process.env.APP_DATA_SHEET_ID, PATIENTS_RANGE);
+        if (paused[existing.patient]) return json(409, { error: "This patient's membership is paused, so shipments are on hold. Restart the membership first." });
         const sentCount = (Number(existing.shipmentsSent) || 0) + 1;
         const total = Number(existing.totalShipments) || 0;
         updated.shipmentsSent = sentCount;
@@ -301,3 +342,4 @@ exports.handler = async (event) => {
     return errorResponse(err);
   }
 };
+exports.shiftPatientShipments = shiftPatientShipments;
