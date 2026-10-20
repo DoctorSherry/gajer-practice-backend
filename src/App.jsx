@@ -550,6 +550,27 @@ function TierSelector({ tier, onChange, disabled, status, onRetry }) {
   );
 }
 
+// Where reminder emails go and when the next follow-up is. Staff only. Saved on its own button so a half-typed address is never sent anywhere.
+function ContactFields({ email, followUp, onEmail, onFollowUp, dirty, saving, error, onSave }) {
+  return (
+    <div className="mt-2 flex items-center gap-2 flex-wrap text-xs" style={{ color: C.inkSoft }}>
+      <span>Reminders:</span>
+      <input
+        type="email" value={email} onChange={(e) => onEmail(e.target.value)} placeholder="Patient email"
+        className="px-2 py-1 rounded-md text-xs outline-none w-56" style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }}
+      />
+      <label className="flex items-center gap-1">
+        Next follow-up
+        <input type="date" value={followUp} onChange={(e) => onFollowUp(e.target.value)} className="px-2 py-1 rounded-md text-xs outline-none" style={{ border: `1px solid ${C.line}`, fontFamily: FONT_MONO }} />
+      </label>
+      <button onClick={onSave} disabled={!dirty || saving} className="px-2.5 py-1 rounded-md font-medium disabled:opacity-40" style={{ background: C.teal, color: "white" }}>
+        {saving ? "Saving…" : "Save"}
+      </button>
+      {error && <span style={{ color: C.clay }}>{error}</span>}
+    </div>
+  );
+}
+
 // Tier 1: peptide selections are final. The patient ticks this before a purchase can be saved.
 function Tier1Notice({ ack, onChange }) {
   return (
@@ -687,6 +708,11 @@ export default function GajerPeptideApp() {
   const [pauseLimit, setPauseLimit] = useState(60);
   const [pauseBusy, setPauseBusy] = useState(false);
   const [tier1Ack, setTier1Ack] = useState(false); // Tier 1: patient has acknowledged "final sale, no refunds or peptide changes"
+  const [contactEmail, setContactEmail] = useState(""); // where reminder emails go for the active patient
+  const [contactFollowUp, setContactFollowUp] = useState(""); // YYYY-MM-DD for the date picker
+  const [contactSaved, setContactSaved] = useState({ email: "", followUp: "" }); // what is stored, to know if there are unsaved edits
+  const [contactSaving, setContactSaving] = useState(false);
+  const [contactError, setContactError] = useState("");
   const [pushDates, setPushDates] = useState({}); // lineId -> date chosen for "push next shipment"
 
   const [query, setQuery] = useState("");
@@ -973,6 +999,40 @@ export default function GajerPeptideApp() {
       showToast(`Couldn't change the tier: ${err.message}`);
     } finally {
       setTierSaving(false);
+    }
+  }
+
+  // "11/5/2026" <-> "2026-11-05" (the date picker's format)
+  const mdyToIso = (v) => { const m = String(v || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); return m ? `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}` : ""; };
+  useEffect(() => {
+    setContactError("");
+    if (!activePatientId || !idToken) { setContactEmail(""); setContactFollowUp(""); setContactSaved({ email: "", followUp: "" }); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await authFetch(`/contacts?patientId=${encodeURIComponent(activePatientId)}`);
+        if (cancelled) return;
+        setContactEmail(d.email || ""); setContactFollowUp(mdyToIso(d.followUp));
+        setContactSaved({ email: d.email || "", followUp: mdyToIso(d.followUp) });
+      } catch { /* reminder details are optional — the rest of the app works without them */ }
+    })();
+    return () => { cancelled = true; };
+  }, [activePatientId, idToken]);
+  async function saveContacts() {
+    if (!activePatientId || contactSaving) return;
+    setContactSaving(true); setContactError("");
+    try {
+      const body = { patientId: activePatientId };
+      if (contactEmail.trim() !== contactSaved.email) body.email = contactEmail.trim();
+      if (contactFollowUp !== contactSaved.followUp) body.followUp = contactFollowUp;
+      const d = await authFetch("/contacts", { method: "POST", body: JSON.stringify(body) });
+      const saved = { email: d.email !== undefined ? d.email : contactSaved.email, followUp: d.followUp !== undefined ? mdyToIso(d.followUp) : contactSaved.followUp };
+      setContactSaved(saved); setContactEmail(saved.email); setContactFollowUp(saved.followUp);
+      showToast("Reminder details saved");
+    } catch (err) {
+      setContactError(err.message);
+    } finally {
+      setContactSaving(false);
     }
   }
 
@@ -1838,6 +1898,10 @@ export default function GajerPeptideApp() {
             )}
           </div>
           {activePatientId && tierStatus === "ok" && patientTier === 1 && <Tier1Notice ack={tier1Ack} onChange={setTier1Ack} />}
+          {activePatientId && !patientMode && (
+            <ContactFields email={contactEmail} followUp={contactFollowUp} onEmail={setContactEmail} onFollowUp={setContactFollowUp}
+              dirty={contactEmail.trim() !== contactSaved.email || contactFollowUp !== contactSaved.followUp} saving={contactSaving} error={contactError} onSave={saveContacts} />
+          )}
           {activePatientId && tierStatus === "ok" && !patientMode && (
             <PauseControl tier={patientTier} pausedSince={pausedSince} pausedDays={pausedDays} limit={pauseLimit} busy={pauseBusy} onPause={pauseMembership} onRestart={restartMembership} />
           )}
