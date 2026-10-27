@@ -1,6 +1,7 @@
 const { readRange } = require("./_lib/sheets");
 const { verifyRequest } = require("./_lib/auth");
 const { penVendors } = require("./_lib/pens");
+const { strikerVendors } = require("./_lib/striker");
 const { rowsToObjects, pickField, toNumber, parseStrengthInfo, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
 const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", "peptide name"];
@@ -21,6 +22,9 @@ exports.handler = async (event) => {
     // Pens live on their own tab of the same workbook. If that tab is missing or unreadable the
     // rest of the catalog must still load, so a failure here is reported, not thrown.
     const pensPromise = readRange(process.env.VENDOR_SHEET_ID, process.env.PENS_RANGE || "Pens").catch((e) => ({ error: e.message }));
+    // Striker (503A pharmacy) lists live on their own tabs too; same rule — a missing tab never breaks the catalog.
+    const strikerPromise = readRange(process.env.VENDOR_SHEET_ID, process.env.STRIKER_RANGE || "Striker Peptides").catch((e) => ({ error: e.message }));
+    const strikerPensPromise = readRange(process.env.VENDOR_SHEET_ID, process.env.STRIKER_PENS_RANGE || "Striker Pens").catch((e) => ({ error: e.message }));
     const [vendorRows, protocolRows] = await Promise.all([
       readRange(process.env.VENDOR_SHEET_ID, process.env.VENDOR_RANGE || "Sheet1"),
       readRange(process.env.PROTOCOL_SHEET_ID, process.env.PROTOCOL_RANGE || "Sheet1"),
@@ -58,7 +62,16 @@ exports.handler = async (event) => {
     if (Array.isArray(pensRaw)) vendors.push(...penVendors(pensRaw));
     else pensError = pensRaw.error;
 
-    return json(200, { vendors, protocols, pensError, fetchedAt: new Date().toISOString() });
+    const strikerRaw = await strikerPromise, strikerPensRaw = await strikerPensPromise;
+    let strikerError = null;
+    if (Array.isArray(strikerRaw)) vendors.push(...strikerVendors(strikerRaw));
+    else strikerError = strikerRaw.error;
+    if (Array.isArray(strikerPensRaw)) {
+      // an empty tab (headers only) simply adds nothing
+      vendors.push(...penVendors(strikerPensRaw).map((v) => ({ ...v, format: `Striker ${v.format}`, source: "Striker" })));
+    } else strikerError = strikerError || strikerPensRaw.error;
+
+    return json(200, { vendors, protocols, pensError, strikerError, fetchedAt: new Date().toISOString() });
   } catch (err) {
     return errorResponse(err);
   }
