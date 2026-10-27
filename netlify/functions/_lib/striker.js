@@ -5,7 +5,7 @@ const { rowsToObjects, pickField, toNumber } = require("./rows");
 //   - strength is the pharmacy's total "API mg" (the part before "total"); vitamins in the
 //     concentration text such as "(1mg/0.5mL)" are never added in.
 //   - the Price ($) column is the price used; "Bulk Price ($)" is kept in the sheet only.
-//   - the format is labelled "Striker ..." so staff can tell it from the Healing Biologix option.
+//   - rows carry source: "Striker" (Healing Biologix rows carry "Healing Biologix") and the app shows it as a tag.
 
 const NAME_KEYS = ["peptide / product name", "product", "peptide", "name", "product name"];
 const FORMAT_KEYS = ["mode of delivery", "format", "delivery"];
@@ -47,7 +47,7 @@ function strikerVendors(rows) {
       const mode = (pickField(r, FORMAT_KEYS) || "Vial").toString().trim();
       return {
         name: strikerName(pickField(r, NAME_KEYS)),
-        format: /^striker/i.test(mode) ? mode : `Striker ${mode}`,
+        format: mode.replace(/^striker\s*/i, "") || "Vial",
         strengthMg: totalMgOf(pickField(r, STRENGTH_KEYS)),
         unitRecognized: true,
         wholesalePrice: toNumber(pickField(r, PRICE_KEYS)),

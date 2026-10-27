@@ -4,6 +4,8 @@ const { penVendors } = require("./_lib/pens");
 const { strikerVendors } = require("./_lib/striker");
 const { rowsToObjects, pickField, toNumber, parseStrengthInfo, json, errorResponse, corsHeaders } = require("./_lib/rows");
 
+// Which supplier a catalog row comes from — shown as a tag so staff can tell the two apart.
+const HB = "Healing Biologix";
 const VENDOR_NAME_KEYS = ["product", "peptide", "name", "item", "product name", "peptide name"];
 const FORMAT_KEYS = ["format", "delivery", "type", "delivery format"];
 const STRENGTH_KEYS = ["strength", "size", "strength (mg)", "strength_mg", "mg", "volume"];
@@ -41,6 +43,7 @@ exports.handler = async (event) => {
           rawStrength: strengthInfo.rawStrength,
           rawUnitValue: strengthInfo.rawUnitValue,
           wholesalePrice: toNumber(pickField(r, PRICE_KEYS)),
+          source: HB,
         };
       })
       // Keep a row if it has a usable mg strength OR is a flagged non-mg
@@ -59,7 +62,7 @@ exports.handler = async (event) => {
 
     const pensRaw = await pensPromise;
     let pensError = null;
-    if (Array.isArray(pensRaw)) vendors.push(...penVendors(pensRaw));
+    if (Array.isArray(pensRaw)) vendors.push(...penVendors(pensRaw).map((v) => ({ ...v, source: HB })));
     else pensError = pensRaw.error;
 
     const strikerRaw = await strikerPromise, strikerPensRaw = await strikerPensPromise;
@@ -68,7 +71,7 @@ exports.handler = async (event) => {
     else strikerError = strikerRaw.error;
     if (Array.isArray(strikerPensRaw)) {
       // an empty tab (headers only) simply adds nothing
-      vendors.push(...penVendors(strikerPensRaw).map((v) => ({ ...v, format: `Striker ${v.format}`, source: "Striker" })));
+      vendors.push(...penVendors(strikerPensRaw).map((v) => ({ ...v, source: "Striker" })));
     } else strikerError = strikerError || strikerPensRaw.error;
 
     return json(200, { vendors, protocols, pensError, strikerError, fetchedAt: new Date().toISOString() });

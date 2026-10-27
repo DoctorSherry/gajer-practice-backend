@@ -196,7 +196,7 @@ exports.handler = async (event) => {
         const coveredPurchase = isPurchase && l.covered === true;
         return rowFromFields({
           date, patient: patientId, doctor: doctor.name, visitId,
-          peptide: `${l.name} \\ ${l.vendor?.format || ""} \\ ${l.vendor?.strengthMg ? l.vendor.strengthMg + "mg" : l.vendor?.rawStrength || ""}${blendName ? ` (blend: ${blendName})` : ""}`,
+          peptide: `${l.name} \\ ${l.vendor?.source ? l.vendor.source + " " : ""}${l.vendor?.format || ""} \\ ${l.vendor?.strengthMg ? l.vendor.strengthMg + "mg" : l.vendor?.rawStrength || ""}${blendName ? ` (blend: ${blendName})` : ""}`,
           dose: l.config ? `${l.config.doseMg}${l.doseUnit || "mg"}` : "",
           frequency: l.config ? l.config.freqPerWeek : "",
           duration: l.config ? l.config.durationWeeks : "",

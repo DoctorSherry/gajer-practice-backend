@@ -271,6 +271,7 @@ function buildDatabase(vendors, protocols) {
       rawUnitValue: v.rawUnitValue,
       wholesalePrice: Number(v.wholesalePrice),
       pen: v.pen || null,
+      source: v.source || "",
     });
   });
   protocols.forEach((p) => {
@@ -380,6 +381,12 @@ function parseProtocolRow(r) {
 /* ---------------------------------------------------------------
    SMALL UI PRIMITIVES
 --------------------------------------------------------------- */
+// Supplier tag: lets staff tell a Healing Biologix option from a Striker one at a glance.
+function SourceTag({ source }) {
+  if (!source) return null;
+  return <Tag tone={source === "Striker" ? "amber" : "teal"}>{source}</Tag>;
+}
+
 function Tag({ tone, children, icon }) {
   const tones = {
     amber: { bg: C.amberSoft, fg: C.amber },
@@ -1375,7 +1382,7 @@ export default function GajerPeptideApp() {
       doseUnit,
       phases: usePhased ? phases.map((p) => ({ ...p })) : undefined,
       totalMg,
-      vendor: selectedVendor ? { format: selectedVendor.format, strengthMg: selectedVendor.strengthMg, wholesalePrice: selectedVendor.wholesalePrice, rawStrength: selectedVendor.rawStrength } : null,
+      vendor: selectedVendor ? { source: selectedVendor.source, format: selectedVendor.format, strengthMg: selectedVendor.strengthMg, wholesalePrice: selectedVendor.wholesalePrice, rawStrength: selectedVendor.rawStrength } : null,
       unitsNeeded: selectedVendor ? selectedVendor.computed.unitsNeeded : 0,
       penGuide: !usePhased && doseUnit === "mg" ? penGuide(selectedVendor, config.doseMg, config.freqPerWeek) : null,
       officeCost,
@@ -1540,7 +1547,7 @@ export default function GajerPeptideApp() {
       name: c.name,
       config: { doseMg: c.doseMg, freqPerWeek: blendFreqPerWeek, durationWeeks: blendDurationWeeks },
       totalMg: c.totalMg,
-      vendor: c.vendor ? { format: c.vendor.format, strengthMg: c.vendor.strengthMg, wholesalePrice: c.vendor.wholesalePrice } : null,
+      vendor: c.vendor ? { source: c.vendor.source, format: c.vendor.format, strengthMg: c.vendor.strengthMg, wholesalePrice: c.vendor.wholesalePrice } : null,
       unitsNeeded: c.computed.unitsNeeded,
       officeCost: c.computed.costOffice,
       multiplier: blendMultiplier,
@@ -2220,7 +2227,7 @@ export default function GajerPeptideApp() {
                             <>
                               <div>
                                 <div className="text-sm font-medium" style={{ color: C.ink }}>
-                                  {v.format} · {v.rawStrength} — {money(v.wholesalePrice)}
+                                  {!patientMode && <SourceTag source={v.source} />} {v.format} · {v.rawStrength} — {money(v.wholesalePrice)}
                                 </div>
                                 <div className="text-xs mt-1" style={{ color: C.amber }}>Dosed in IU — enter dose manually below</div>
                               </div>
@@ -2236,7 +2243,7 @@ export default function GajerPeptideApp() {
                             <>
                               <div>
                                 <div className="text-sm font-medium" style={{ color: C.ink }}>
-                                  {v.format} · {v.strengthMg}mg — {money(v.wholesalePrice)}{isStrip ? ` /box of ${STRIPS_PER_BOX}` : ""}
+                                  <SourceTag source={v.source} /> {v.format} · {v.strengthMg}mg — {money(v.wholesalePrice)}{isStrip ? ` /box of ${STRIPS_PER_BOX}` : ""}
                                   {v.isCheapest && <Tag tone="green" icon={<TrendingDown size={11} />}>Best value</Tag>}
                                   {v.isPriciest && <Tag tone="clay" icon={<TrendingUp size={11} />}>Highest cost</Tag>}
                                 </div>
@@ -2345,7 +2352,7 @@ export default function GajerPeptideApp() {
 
                           {/* receipt-style ledger, the app's signature element */}
                           <div className="rounded-lg p-3 mb-4" style={{ background: C.paper, fontFamily: FONT_MONO, fontSize: 13 }}>
-                            <LedgerRow label={`${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
+                            <LedgerRow label={`${!patientMode && selectedVendor.source ? selectedVendor.source + " · " : ""}${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
                             {!patientMode && selectedVendor.pen && !currentPenGuide && selectedVendor.pen.unitsOk === false && <LedgerRow label="Pen units" value="not available — see Pens sheet" sub />}
                             {currentPenGuide && <LedgerRow label="Pen: take per dose" value={`${currentPenGuide.whole ? "" : "≈ "}${currentPenGuide.unitsPerDose} unit${currentPenGuide.unitsPerDose === 1 ? "" : "s"}`} />}
@@ -2439,7 +2446,7 @@ export default function GajerPeptideApp() {
                         </div>
                       ) : (
                         <div className="text-xs mt-0.5" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>
-                          {l.vendor.format} · {l.vendor.strengthMg}mg — {fmtMg(l.totalMg)} course · {l.unitsNeeded} unit(s){l.penGuide ? ` · ${penGuideText(l.penGuide)}` : ""}
+                          {l.vendor.source ? `${l.vendor.source} · ` : ""}{l.vendor.format} · {l.vendor.strengthMg}mg — {fmtMg(l.totalMg)} course · {l.unitsNeeded} unit(s){l.penGuide ? ` · ${penGuideText(l.penGuide)}` : ""}
                         </div>
                       )}
                     </div>
@@ -2636,7 +2643,7 @@ export default function GajerPeptideApp() {
                           >
                             {c.vendorOptions.length === 0 && <option value="">No vendor pricing found</option>}
                             {c.vendorOptions.map((v) => (
-                              <option key={v.id} value={v.id}>{v.format} · {v.strengthMg}mg{patientMode ? "" : ` — ${money(v.wholesalePrice)}`}</option>
+                              <option key={v.id} value={v.id}>{!patientMode && v.source ? `${v.source} · ` : ""}{v.format} · {v.strengthMg}mg{patientMode ? "" : ` — ${money(v.wholesalePrice)}`}</option>
                             ))}
                           </select>
                         </label>
