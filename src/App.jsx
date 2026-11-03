@@ -2227,14 +2227,14 @@ export default function GajerPeptideApp() {
                             <>
                               <div>
                                 <div className="text-sm font-medium" style={{ color: C.ink }}>
-                                  {!patientMode && <SourceTag source={v.source} />} {v.format} · {v.rawStrength} — {money(v.wholesalePrice)}
+                                  <SourceTag source={v.source} /> {v.format} · {v.rawStrength} — {money(v.wholesalePrice)}
                                 </div>
                                 <div className="text-xs mt-1" style={{ color: C.amber }}>Dosed in IU — enter dose manually below</div>
                               </div>
                             </>
                           ) : patientMode ? (
                             <>
-                              <div className="text-sm font-medium" style={{ color: C.ink }}>{v.format} · {v.strengthMg}mg</div>
+                              <div className="text-sm font-medium" style={{ color: C.ink }}><SourceTag source={v.source} /> {v.format} · {v.strengthMg}mg</div>
                               <div className="text-right">
                                 <div className="text-sm font-semibold" style={{ color: C.amber, fontFamily: FONT_MONO }}>{money(v.computed.costOffice * multiplier)}</div>
                               </div>
@@ -2352,7 +2352,7 @@ export default function GajerPeptideApp() {
 
                           {/* receipt-style ledger, the app's signature element */}
                           <div className="rounded-lg p-3 mb-4" style={{ background: C.paper, fontFamily: FONT_MONO, fontSize: 13 }}>
-                            <LedgerRow label={`${!patientMode && selectedVendor.source ? selectedVendor.source + " · " : ""}${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
+                            <LedgerRow label={`${selectedVendor.source ? selectedVendor.source + " · " : ""}${selectedVendor.format} · ${selectedVendor.strengthMg}mg × ${selectedVendor.computed.unitsNeeded}`} value={money(officeCost)} />
                             <LedgerRow label="Per-mg office rate" value={`${money(selectedVendor.computed.perMgRate)}/mg`} sub />
                             {!patientMode && selectedVendor.pen && !currentPenGuide && selectedVendor.pen.unitsOk === false && <LedgerRow label="Pen units" value="not available — see Pens sheet" sub />}
                             {currentPenGuide && <LedgerRow label="Pen: take per dose" value={`${currentPenGuide.whole ? "" : "≈ "}${currentPenGuide.unitsPerDose} unit${currentPenGuide.unitsPerDose === 1 ? "" : "s"}`} />}
@@ -2643,7 +2643,7 @@ export default function GajerPeptideApp() {
                           >
                             {c.vendorOptions.length === 0 && <option value="">No vendor pricing found</option>}
                             {c.vendorOptions.map((v) => (
-                              <option key={v.id} value={v.id}>{!patientMode && v.source ? `${v.source} · ` : ""}{v.format} · {v.strengthMg}mg{patientMode ? "" : ` — ${money(v.wholesalePrice)}`}</option>
+                              <option key={v.id} value={v.id}>{v.source ? `${v.source} · ` : ""}{v.format} · {v.strengthMg}mg{patientMode ? "" : ` — ${money(v.wholesalePrice)}`}</option>
                             ))}
                           </select>
                         </label>
@@ -3256,7 +3256,7 @@ export default function GajerPeptideApp() {
                           )}
                         </div>
                       )}
-                      {fields.vendor && <div className="text-xs mb-1" style={{ color: C.inkSoft }}>Product: {l.vendor.format}, {l.vendor.strengthMg}mg ({l.unitsNeeded} unit{l.unitsNeeded === 1 ? "" : "s"})</div>}
+                      {fields.vendor && <div className="text-xs mb-1" style={{ color: C.inkSoft }}>Product: {l.vendor.source ? `${l.vendor.source} ` : ""}{l.vendor.format}, {l.vendor.strengthMg}mg ({l.unitsNeeded} unit{l.unitsNeeded === 1 ? "" : "s"})</div>}
                       {l.penGuide && <div className="text-xs mb-1" style={{ color: C.ink }}>{penGuideText(l.penGuide)}</div>}
                       {fields.perMg && <div className="text-xs mb-1" style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>{money(l.vendor.wholesalePrice / l.vendor.strengthMg)}/mg office</div>}
                       <div className="flex gap-4 mt-1">
